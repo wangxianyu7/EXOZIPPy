@@ -1,5 +1,5 @@
 # EXOZIPPy
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/wangxianyu7/jdeast/EXOZIPPy)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/jdeast/EXOZIPPy)
 
 initial commit for EXOFASTv2 python translation
 This will eventually be a python implementation of EXOFASTv2, but is a long ways off
