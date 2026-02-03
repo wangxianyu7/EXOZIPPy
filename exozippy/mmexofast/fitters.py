@@ -18,25 +18,81 @@ class MulensFitter():
     parameters_to_fit = *list* of parameters to be fitted. If None, fits all model parameters.
     mag_methods = *list*
         see MulensModel.model.mag_methods.
+    coords = *str* or *astropy.SkyCoords*
     verbose = *bool*
         default is False.
     """
 
-    def __init__(self, datasets=None, initial_model=None, parameters_to_fit=None, sigmas=None, mag_methods=None, verbose=False, pool=None):
+    def __init__(
+            self, datasets=None, initial_model_params=None, parameters_to_fit=None, sigmas=None,
+            mag_methods=None, coords=None, limb_darkening_coeffs_gamma=None,
+            limb_darkening_coeffs_u=None,
+            fix_source_flux=None, fix_blend_flux=None,
+            verbose=False, pool=None):
         self._initial_model = None
         self._best = None
+        self._results = None
 
         self.datasets = datasets
-        self.initial_model = initial_model
+
+        self.initial_model_params = initial_model_params
         self.parameters_to_fit = parameters_to_fit
         self.sigmas = sigmas
+
         self.mag_methods = mag_methods
+        self.limb_darkening_coeffs_gamma = limb_darkening_coeffs_gamma
+        self.limb_darkening_coeffs_u = limb_darkening_coeffs_u
+        self.fix_source_flux = fix_source_flux
+        self.fix_blend_flux = fix_blend_flux
+
+        self.coords = coords
+
         self.verbose = verbose
         self.pool = pool
 
-
     def run(self):
         pass
+
+    def get_model(self):
+        model = MulensModel.Model(self.initial_model_params)
+        #print('fitter 49', self.mag_methods)
+        if self.mag_methods is not None:
+            #print('setting mag_methods')
+            model.set_magnification_methods(self.mag_methods)
+            #print('results', model.get_magnification_methods())
+
+        if self.limb_darkening_coeffs_u is not None:
+            for band, value in self.limb_darkening_coeffs_u.items():
+                model.set_limb_coeff_u(band, value)
+
+        if self.limb_darkening_coeffs_gamma is not None:
+            for band, value in self.limb_darkening_coeffs_gamma.items():
+                model.set_limb_coeff_gamma(band, value)
+
+        #print('fitter 60', model)
+        return model
+
+    def get_event(self):
+        event = MulensModel.Event(
+            datasets=self.datasets, model=self.get_model(), coords=self.coords,
+            fix_source_flux=self.fix_source_flux, fix_blend_flux=self.fix_blend_flux)
+
+        return event
+
+    def get_diagnostic_str(self):
+        """ Print chi2 for each dataset and fitted fluxes."""
+        event = self.get_event()
+        event.fit_fluxes()
+        msg = f'\nModel:\n{event.model}\n\nDatasets:'
+        msg += '\n{0:20} {1:>4} {2:>12} {3} {4}'.format('Label', 'N_good', 'chi2', 'f_source', 'f_blend')
+        for i, dataset in enumerate(event.datasets):
+            msg += ('\n{0:20} {1:4} {2:12.2f} {3} {4}'.format(
+                dataset.plot_properties['label'], np.sum(dataset.good),
+                event.get_chi2_for_dataset(i),
+                event.fits[i].source_fluxes,
+                event.fits[i].blend_flux))
+
+        return msg
 
     @property
     def best(self):
@@ -50,20 +106,31 @@ class MulensFitter():
         self._best = params_dict
 
     @property
-    def initial_model(self):
-        return self._initial_model
+    def results(self):
+        """
+        *dict* containing full fit results
+        """
+        return self._results
 
-    @initial_model.setter
-    def initial_model(self, params_dict):
+    @results.setter
+    def results(self, value):
+        self._results = value
+
+    @property
+    def initial_model_params(self):
+        return self._initial_model_params
+
+    @initial_model_params.setter
+    def initial_model_params(self, params_dict):
         if (params_dict is not None) and (not isinstance(params_dict, dict)):
             raise ValueError('initial_model must be set with either *None* or *dict*.')
 
-        self._initial_model = params_dict
+        self._initial_model_params = params_dict
 
     @property
     def parameters_to_fit(self):
         if self._parameters_to_fit is None:
-            self._parameters_to_fit = list(self.initial_model.keys())
+            self._parameters_to_fit = list(self.initial_model_params.keys())
 
         return self._parameters_to_fit
 
@@ -83,14 +150,13 @@ class SFitFitter(MulensFitter):
         super().__init__(**kwargs)
 
     def run(self):
-        event = MulensModel.Event(
-            datasets=self.datasets, model=MulensModel.Model(self.initial_model))
+        event = self.get_event()
         event.fit_fluxes()
 
         my_func = sfit.mm_funcs.PointLensSFitFunction(
             event, self.parameters_to_fit)
 
-        initial_guess = [self.initial_model[key] for key in self.parameters_to_fit]
+        initial_guess = [self.initial_model_params[key] for key in self.parameters_to_fit]
         for i in range(len(self.datasets)):
             initial_guess.append(event.fits[i].source_flux)
             initial_guess.append(event.fits[i].blend_flux)
@@ -109,21 +175,20 @@ class SFitFitter(MulensFitter):
             if self.verbose:
                 print(result)
 
+
+        self.results = result
         best = my_func.event.model.parameters.parameters
         best['chi2'] = my_func.event.get_chi2()
         self.best = best
 
 
 class AnomalyFitter(MulensFitter):
-    default_emcee_settings = {
-        'n_walkers': 40, 'n_burn': 500, 'n_steps': 1000,
-        'temperature': 1., 'max_steps': 10000, 'progress': False}
+    default_emcee_settings = {}
 
     def __init__(self, datasets=None, anomaly_lc_params=None, **kwargs):
         super().__init__(**kwargs)
         self.anomaly_lc_params = anomaly_lc_params
         self.datasets = datasets
-        #self.mag_methods = None
 
     def estimate_initial_parameters(self):
         pass
