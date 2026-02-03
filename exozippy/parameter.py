@@ -1,6 +1,6 @@
 import numpy as np
 from astropy import units as u
-import pymc as pm
+# import pymc as pm
 import math
 import ipdb
 
@@ -67,28 +67,28 @@ class Parameter:
             self.value = expression#pm.Deterministic(label, expression)
 
             # if it's deterministic, apply constraints as potentials
-            if lower is not None:
-                pm.Potential("user_upperbound_" + str(ndx), pt.switch(self.value > upper, -np.inf))
-            if upper is not None:
-                pm.Potential("user_lowerbound_" + str(ndx), pt.switch(self.value < lower, -np.inf))
+            # if lower is not None:
+            #     pm.Potential("user_upperbound_" + str(ndx), pt.switch(self.value > upper, -np.inf))
+            # if upper is not None:
+            #     pm.Potential("user_lowerbound_" + str(ndx), pt.switch(self.value < lower, -np.inf))
             if mu is not None and sigma is not None:
                 pass
                 #pm.Potential("user_prior_" + str(ndx), -0.5 * ((param.value - mu) / sigma) ** 2)
         else:
             if (mu is not None) and (sigma is not None) and ((upper is not None) or (lower is not None)):
                 # bounded normal
-                print("bounded normal: " + str(lower) + " < " + label + " = " + str(mu) + ' +/- ' + str(sigma) + " < " + str(upper) + " (initval="+str(initval)+")")
+                # print("bounded normal: " + str(lower) + " < " + label + " = " + str(mu) + ' +/- ' + str(sigma) + " < " + str(upper) + " (initval="+str(initval)+")")
                 self.value = mu#pm.Truncated(label, pm.Normal.dist(mu=mu,sigma=sigma),lower=lower,upper=upper, initval=initval)
             elif (mu is not None) and (sigma is not None):
                 # normal
-                print("normal: " + label + " = " + str(mu) + ' +/- ' + str(sigma) + " (lower=" + str(lower)+', upper='+str(upper)+', initval='+str(initval)+')')
+                # print("normal: " + label + " = " + str(mu) + ' +/- ' + str(sigma) + " (lower=" + str(lower)+', upper='+str(upper)+', initval='+str(initval)+')')
                 self.value = mu#pm.Normal(label, mu=mu, sigma=sigma, initval=initval)
             elif (mu is not None):
-                print("uniform: " + label + " = " + str(mu) + " (lower=n/a, upper=n/a, initval="+str(initval)+')')
+                # print("uniform: " + label + " = " + str(mu) + " (lower=n/a, upper=n/a, initval="+str(initval)+')')
                 self.value = mu#pm.Uniform(label, lower=lower, upper=upper, initval=initval)
             else:
                 # uniform
-                print("uniform: " + str(lower) + " < " + label + " < " + str(upper) + " (initval="+str(initval)+', mu='+str(mu)+', sigma='+str(sigma)+")")
+                # print("uniform: " + str(lower) + " < " + label + " < " + str(upper) + " (initval="+str(initval)+', mu='+str(mu)+', sigma='+str(sigma)+")")
                 self.value = initval#pm.Uniform(label, lower=lower, upper=upper, initval=initval)
 
         if add_potential:

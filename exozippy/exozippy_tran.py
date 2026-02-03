@@ -72,16 +72,17 @@ def exozippy_tran(
     depth = np.zeros_like(z) - 1.0  # Placeholder for z2
     primary = depth < 0
     secondary = ~primary
-
-    if np.any(primary):
-        mu1,mu0 = exozippy_occultquad_cel(z[primary], u1, u2, p)
+    
+    if primary.any():
+    # if np.any(primary):
+        mu1,mu0, _ = exozippy_occultquad_cel(z[primary], u1, u2, p)
         modelflux[primary] = mu1
 
     # Calculate fraction of the planet visible at each time
     if thermal != 0.0 or reflect != 0.0:
         planetvisible = np.ones_like(time)
         if np.any(secondary):
-            mu1,mu0 = exozippy_occultquad_cel(z[secondary] / abs(p), 0.0, 0.0, 1.0 / p)
+            mu1,mu0, _ = exozippy_occultquad_cel(z[secondary] / abs(p), 0.0, 0.0, 1.0 / p)
             planetvisible[secondary] = mu1
     else:
         planetvisible = 1.0

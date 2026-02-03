@@ -513,33 +513,43 @@ def bjd2target(
 #   x1, y1, z1   - Star position in barycentric frame
 #   x2, y2, z2   - Planet position in barycentric frame
 # -------------------------------------------------------------------
-def exozippy_getb2(
-    bjd, inc, a, tperiastron, period, e=None, omega=None,
-    lonascnode=None, q=None
-):
-    bjd = np.array(bjd, dtype=np.float64)
-    inc = np.atleast_1d(inc); inc = np.asarray(inc, dtype=np.float64)
-    a = np.atleast_1d(a); a = np.asarray(a, dtype=np.float64)
-    tperiastron = np.atleast_1d(tperiastron); tperiastron = np.asarray(tperiastron, dtype=np.float64)
-    period = np.atleast_1d(period); period = np.asarray(period, dtype=np.float64)
-    nplanets = len(inc)
 
-    shape = bjd.shape
+def exozippy_getb2(bjd, inc, a, tperiastron, period, e=None, omega=None,
+                   lonascnode=None, q=None):    
+    bjd = np.asarray(bjd, dtype=np.float64)
+    inc = np.atleast_1d(inc).astype(np.float64)
+    a = np.atleast_1d(a).astype(np.float64)
+    tperiastron = np.atleast_1d(tperiastron).astype(np.float64)
+    period = np.atleast_1d(period).astype(np.float64)
+    
+    # shape = bjd.shape
     if bjd.ndim == 0:
-        ntimes, ninterp = 1, 1
+        # ntimes, ninterp = 1, 1
         bjd = bjd[None]
     elif bjd.ndim == 1:
-        ntimes, ninterp = len(bjd), 1
+        # ntimes, ninterp = len(bjd), 1
         bjd = bjd[:, None]
     elif bjd.ndim == 2:
-        ntimes, ninterp = bjd.shape
+        # ntimes, ninterp = bjd.shape
+        pass
     else:
         raise ValueError("Incompatible dimensions for BJD")
-
-    # Default eccentricity, omega, q
+    nplanets = len(inc)
     e = np.atleast_1d(e if e is not None else np.zeros(nplanets))
     omega = np.atleast_1d(omega if omega is not None else np.ones(nplanets) * (np.pi / 2))
     q = np.atleast_1d(q if q is not None else np.full(nplanets, np.inf))
+    
+    b = exozippy_getb2_(bjd, inc, a, tperiastron, period, e, omega, lonascnode, q)
+    return b.squeeze()
+
+
+
+@njit
+def exozippy_getb2_(
+    bjd, inc, a, tperiastron, period, e=None, omega=None,
+    lonascnode=None, q=None):
+    nplanets = len(inc)
+    ntimes, ninterp = bjd.shape
 
     # Allocate arrays
     x1 = np.zeros((ntimes, ninterp))
@@ -554,6 +564,10 @@ def exozippy_getb2(
     y0 = np.zeros((nplanets, ntimes, ninterp))
     z0 = np.zeros((nplanets, ntimes, ninterp))
 
+    x1tmp = np.zeros((nplanets, ntimes, ninterp))
+    y1tmp = np.zeros((nplanets, ntimes, ninterp))
+    z1tmp = np.zeros((nplanets, ntimes, ninterp))
+
     isinf = ~np.isfinite(q)
     isfinite = np.isfinite(q)
     na = a.shape
@@ -565,6 +579,13 @@ def exozippy_getb2(
     a2[isfinite] = a[isfinite] * q[isfinite] / (1.0 + q[isfinite])
     a1[isfinite] = a2[isfinite] / q[isfinite]
 
+
+    sqrt_fac = np.zeros(nplanets)
+    for i in range(nplanets):
+        if e[i] != 0.0:
+            sqrt_fac[i] = np.sqrt((1 + e[i]) / (1 - e[i]))
+
+
     for i in range(nplanets):
         # Mean anomaly
         meananom = 2.0 * np.pi * ((bjd - tperiastron[i]) / period[i])
@@ -572,17 +593,27 @@ def exozippy_getb2(
 
         if e[i] != 0.0:
             eccanom = exozippy_keplereq(meananom, e[i])
-            trueanom = 2.0 * np.arctan(np.sqrt((1 + e[i]) / (1 - e[i])) * np.tan(eccanom / 2.0))
+            # trueanom = 2.0 * np.arctan(np.sqrt((1 + e[i]) / (1 - e[i])) * np.tan(eccanom / 2.0))
+            trueanom = 2.0 * np.arctan(sqrt_fac[i] * np.tan(eccanom / 2.0))
+
         else:
             trueanom = meananom
-
+            
+            
+        theta = trueanom + omega[i]
+        cos_theta = np.cos(theta)
+        sin_theta = np.sin(theta)
         # Distance and coordinates (planet in barycentric frame)
         r2 = -a2[i] * (1 - e[i] ** 2) / (1 + e[i] * np.cos(trueanom))
 
-        x2[i] = (r2 * np.cos(trueanom + omega[i])).reshape(ntimes, ninterp)
-        tmp = r2 * np.sin(trueanom + omega[i])
-        y2[i] = (tmp * np.cos(inc[i])).reshape(ntimes, ninterp)
-        z2[i] = (tmp * np.sin(inc[i])).reshape(ntimes, ninterp)
+        # x2[i] = (r2 * np.cos(trueanom + omega[i])).reshape(ntimes, ninterp)
+        # tmp = r2 * np.sin(trueanom + omega[i])
+        # y2[i] = (tmp * np.cos(inc[i])).reshape(ntimes, ninterp)
+        # z2[i] = (tmp * np.sin(inc[i])).reshape(ntimes, ninterp)
+        x2[i, :, :] = r2 * cos_theta
+        tmp = r2 * sin_theta
+        y2[i, :, :] = tmp * np.cos(inc[i])
+        z2[i, :, :] = tmp * np.sin(inc[i])
 
         # Rotate by longitude of ascending node if provided
         if lonascnode is not None and len(lonascnode) == nplanets:
@@ -594,10 +625,14 @@ def exozippy_getb2(
 
         # Star position in barycentric frame
         r1 = a1[i] * (1 - e[i] ** 2) / (1 + e[i] * np.cos(trueanom))
-        x1tmp = (r1 * np.cos(trueanom + omega[i])).reshape(ntimes, ninterp)
-        tmp = r1 * np.sin(trueanom + omega[i])
-        y1tmp = (tmp * np.cos(inc[i])).reshape(ntimes, ninterp)
-        z1tmp = (tmp * np.sin(inc[i])).reshape(ntimes, ninterp)
+        # x1tmp = (r1 * np.cos(trueanom + omega[i])).reshape(ntimes, ninterp)
+        x1tmp[i, :, :] = r1 * cos_theta
+        tmp = r1 * sin_theta
+        y1tmp[i, :, :] = (tmp * np.cos(inc[i])).reshape(ntimes, ninterp)
+        z1tmp[i, :, :] = (tmp * np.sin(inc[i])).reshape(ntimes, ninterp)
+        # tmp = r1 * np.sin(trueanom + omega[i])
+        # y1tmp = (tmp * np.cos(inc[i])).reshape(ntimes, ninterp)
+        # z1tmp = (tmp * np.sin(inc[i])).reshape(ntimes, ninterp)
 
         if lonascnode is not None and len(lonascnode) == nplanets:
             lon = lonascnode[i]
@@ -616,7 +651,7 @@ def exozippy_getb2(
 
     # Impact parameter = projected sky-plane separation
     b = np.sqrt(x0**2 + y0**2)
-    return b.squeeze()  # Return 1D if possible
+    return b  # Return 1D if possible
 
 
 
@@ -876,6 +911,7 @@ def ellke(k):
 
 
 # ⚠️ Initial auto-translation from IDL (ChatGPT). Review required.
+@njit
 def sqarea_triangle(z0, p0):
     """
     Computes sixteen times the square of the area of a triangle
@@ -888,7 +924,7 @@ def sqarea_triangle(z0, p0):
     Returns:
         numpy.ndarray: Array containing 16 times the squared areas.
     """
-    z0 = np.array(z0, dtype=np.float64)
+    z0 = np.asarray(z0, dtype=np.float64)
     sqarea = np.zeros_like(z0)
 
     # Six cases to consider
@@ -927,6 +963,7 @@ def sqarea_triangle(z0, p0):
 
 
 # ⚠️ Initial auto-translation from IDL (ChatGPT). Review required.
+@njit
 def exozippy_occultquad_cel(z0, u1, u2, p0, return_coeffs=False):
     """
     Full translation of exozippy_OCCULTQUAD_CEL from IDL.
@@ -956,7 +993,7 @@ def exozippy_occultquad_cel(z0, u1, u2, p0, return_coeffs=False):
         if p >= 1.0:
             z_notused = z[notusedyet]
             occulted = np.where(z_notused <= (p - 1.0))[0]
-            mask = np.ones_like(z_notused, dtype=bool)
+            mask = np.ones(z_notused.shape, dtype=np.bool_)
             mask[occulted] = False
             notused2 = np.where(mask)[0]
 
@@ -1199,15 +1236,17 @@ def exozippy_occultquad_cel(z0, u1, u2, p0, return_coeffs=False):
         mu0 = 1.0 - lambdae
 
         # Optional limb darkening coefficient output
-        if return_coeffs:  # mimic `arg_present(d)` behavior
-            d = np.array([
-                1.0 - lambdae,
-                (2.0 / 3.0) * (lambdae - z_mask) - lambdad,
-                lambdae / 2.0 - etad
-            ])
+        if return_coeffs:
+            N = lambdae.shape[0]
+            d = np.empty((3, N), dtype=np.float64)
+            d[0, :] = 1.0 - lambdae
+            d[1, :] = (2.0 / 3.0) * (lambdae - z_mask) - lambdad
+            d[2, :] = lambdae / 2.0 - etad
             return muo1, mu0, d
         else:
-            return muo1, mu0
+            d = np.empty((3, 1), dtype=np.float64)  # dummy placeholder
+            return muo1, mu0, d
+
     else:
         # Negative p0 — treat as anti-transit (e.g., for symmetry or edge cases)
         muo1 = 1.0 + (
@@ -1218,11 +1257,12 @@ def exozippy_occultquad_cel(z0, u1, u2, p0, return_coeffs=False):
 
         mu0 = 1.0 + lambdae
         if return_coeffs:
-            d = np.array([
-                1.0 + lambdae,
-                (2.0 / 3.0) * (z_mask - lambdae) + lambdad,
-                etad - lambdae / 2.0
-            ])
+            N = lambdae.shape[0]
+            d = np.empty((3, N), dtype=np.float64)
+            d[0, :] = 1.0 + lambdae
+            d[1, :] = (2.0 / 3.0) * (z_mask - lambdae) + lambdad
+            d[2, :] = etad - lambdae / 2.0
             return muo1, mu0, d
         else:
-            return muo1, mu0
+            d = np.empty((3, 1), dtype=np.float64)  # dummy placeholder
+            return muo1, mu0, d
