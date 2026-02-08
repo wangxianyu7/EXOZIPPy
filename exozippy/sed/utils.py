@@ -196,9 +196,9 @@ def mistmultised(teff, logg, feh, av, distance, lstar, errscale, sedfile,
     sedbands   = sed_data['sedbands']
     mags       = sed_data['mag']
     errs       = sed_data['errmag']
-    blend_spec = sed_data['blend']
+    blend      = sed_data['blend']   # already (nbands, nstars) int array
     nbands     = len(sedbands)
-    
+
     # ---------- 3. Load / cache the MIST grid & BC cubes ------------------
     root = pathlib.Path(exozippy.MODULE_PATH) / 'EXOZIPPy' / 'exozippy' / 'sed' / 'mist'
     gridfile = root / 'mist.sed.grid.idl'
@@ -230,25 +230,11 @@ def mistmultised(teff, logg, feh, av, distance, lstar, errscale, sedfile,
             raise FileNotFoundError(f"{band} not supported – remove it from {sedfile}")
 
     bcarrays = np.stack(bc_cubes, axis=-1)  # shape: (nteff, nlogg, nfeh, nav, nbands)
-    # ---------- 4. Expand blend matrix to (nbands, nstars) ----------------
-    blend = np.zeros((nbands, nstars), dtype=int)
-    for i, token in enumerate(blend_spec):
-        if token == 'ALL':
-            blend[i, :] = 1
-            continue
-        if '-' in token:                      # differential magnitudes
-            pos, neg = (np.fromstring(t, sep=',', dtype=int)
-                        for t in token.split('-'))
-            blend[i, np.clip(pos, 0, nstars-1)] = +1
-            blend[i, np.clip(neg, 0, nstars-1)] = -1
-        else:                                 # unblended magnitudes
-            idx = np.fromstring(token, sep=',', dtype=int)
-            blend[i, np.clip(idx, 0, nstars-1)] = 1
 
     if blend0 is not None:
         blend0[:] = blend.copy()
 
-    # ---------- 5. Interpolate bolometric corrections ---------------------
+    # ---------- 4. Interpolate bolometric corrections ---------------------
     bcs = np.empty((nbands, nstars))
     for j in range(nstars):
         coord = [get_grid_point(g, v) for g, v in
@@ -258,7 +244,7 @@ def mistmultised(teff, logg, feh, av, distance, lstar, errscale, sedfile,
                   (avgrid,   av[j]))]
         for i in range(nbands):
             bcs[i, j] = ninterpolate(bcarrays[..., i], coord)
-    # ---------- 6. Model magnitudes / fluxes ------------------------------
+    # ---------- 5. Model magnitudes / fluxes ------------------------------
     mu         = 5.0 * np.log10(distance) - 5.0         # (nstars,)
     logL_term  = -2.5 * np.log10(lstar)                 # (nstars,)
     modelmag   = (logL_term[None, :] + 4.74             # (nbands, nstars)
@@ -278,8 +264,9 @@ def mistmultised(teff, logg, feh, av, distance, lstar, errscale, sedfile,
         magresiduals   = mags - blendmag
         blendflux      = (modelflux * blend).sum(axis=1)
 
-    # ---------- 7. χ² likelihood ------------------------------------------
-    sedchi2 = np.sum((magresiduals / (errs * err0)) ** 2)
+    # ---------- 6. χ² likelihood (matches IDL exofast_like /chi2) ----------
+    sigma = errs * err0
+    sedchi2 = np.sum(magresiduals**2 / sigma**2 + np.log(2.0 * np.pi * sigma**2))
     return sedchi2, blendmag, modelflux, magresiduals
 
 
