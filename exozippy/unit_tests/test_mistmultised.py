@@ -3,7 +3,7 @@ import pathlib
 import numpy as np
 
 import exozippy
-from exozippy.sed.utils import mistmultised
+from exozippy.sed.utils import mistmultised, read_sed_file
 
 
 class TestMistMultiSED(unittest.TestCase):
@@ -40,9 +40,11 @@ class TestMistMultiSED(unittest.TestCase):
         )
 
         # ---------------- call mistmultised ------------------------------
+        sed_data = read_sed_file(sedfile, 1)
         sedchi2, blendmag, modelflux, magresiduals = mistmultised(
             teff, logg, feh, av, dist, lstar, errsc,
             sedfile=sedfile,
+            sed_data=sed_data,
             redo=False, psname=None, debug=False,
             atmospheres=None, wavelength=None, logname=None,
             xyrange=None, blend0=None

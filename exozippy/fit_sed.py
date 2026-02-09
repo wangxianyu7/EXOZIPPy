@@ -56,7 +56,7 @@ def _derive_lstar(teff, rstar):
             * CONSTANTS['sigmab'] * teff**4 / CONSTANTS['LSun'])
 
 
-def sed_negloglike(params, sedfile, priors, mstar):
+def sed_negloglike(params, sedfile, priors, mstar, sed_data=None):
     """
     Total negative-log-likelihood for the SED fit.
 
@@ -93,7 +93,8 @@ def sed_negloglike(params, sedfile, priors, mstar):
     # SED chi2 (matches IDL exofast_like /chi2)
     try:
         sedchi2, blendmag, modelflux, magresiduals = mistmultised(
-            teff, logg, feh, av, distance, lstar, errscale, sedfile
+            teff, logg, feh, av, distance, lstar, errscale, sedfile,
+            sed_data=sed_data
         )
     except Exception:
         return 1e10
@@ -140,7 +141,10 @@ def fit_sed(priorfile, sedfile, verbose=True):
     result : dict
         Best-fit parameters, chi2, derived quantities.
     """
+    from exozippy.sed.utils import read_sed_file
+
     priors = parse_priors(priorfile)
+    sed_data = read_sed_file(sedfile, 1)
 
     # Fixed mass
     mstar = priors.get('mstar', {}).get('value', 1.0)
@@ -162,7 +166,7 @@ def fit_sed(priorfile, sedfile, verbose=True):
         print(f"Fixed: mstar = {mstar:.3f} Msun")
         print(f"Starting: Teff={teff0:.0f} K, Rstar={rstar0:.3f} Rsun, "
               f"[Fe/H]={feh0:.3f}, Av={av0:.3f}, dist={dist0:.2f} pc")
-        chi2_init = sed_negloglike(x0, sedfile, priors, mstar)
+        chi2_init = sed_negloglike(x0, sedfile, priors, mstar, sed_data=sed_data)
         print(f"Initial chi2 = {chi2_init:.2f}")
         print()
 
@@ -182,14 +186,14 @@ def fit_sed(priorfile, sedfile, verbose=True):
 
     # Phase 1: Nelder-Mead (no gradients needed, robust)
     res_nm = minimize(sed_negloglike, x0,
-                      args=(sedfile, priors, mstar),
+                      args=(sedfile, priors, mstar, sed_data),
                       method='Nelder-Mead',
                       options={'maxiter': 10000, 'xatol': 1e-6,
                                'fatol': 1e-6, 'adaptive': True})
 
     # Phase 2: Polish with L-BFGS-B (respects bounds)
     res = minimize(sed_negloglike, res_nm.x,
-                   args=(sedfile, priors, mstar),
+                   args=(sedfile, priors, mstar, sed_data),
                    method='L-BFGS-B', bounds=bounds,
                    options={'maxiter': 5000, 'ftol': 1e-12})
 
@@ -250,8 +254,11 @@ def run_mcmc(priorfile, sedfile, bestfit=None, nwalkers=32, nsteps=5000,
     """
     import emcee
 
+    from exozippy.sed.utils import read_sed_file
+
     priors = parse_priors(priorfile)
     mstar = priors.get('mstar', {}).get('value', 1.0)
+    sed_data = read_sed_file(sedfile, 1)
 
     if bestfit is None:
         bestfit = fit_sed(priorfile, sedfile, verbose=verbose)
@@ -270,7 +277,7 @@ def run_mcmc(priorfile, sedfile, bestfit=None, nwalkers=32, nsteps=5000,
     pos[:, 3] = np.abs(pos[:, 3])
 
     def log_prob(params):
-        chi2 = sed_negloglike(params, sedfile, priors, mstar)
+        chi2 = sed_negloglike(params, sedfile, priors, mstar, sed_data=sed_data)
         if not np.isfinite(chi2) or chi2 > 1e9:
             return -np.inf
         return -0.5 * chi2  # chi2 is already -2*lnL, so lnL = -chi2/2
@@ -342,13 +349,12 @@ def plot_sed(priorfile, sedfile, bestfit=None, samples=None, outfile=None):
     lstar = bestfit['lstar']
 
     # Compute best-fit model
-    sedchi2, blendmag, modelflux, magresiduals = mistmultised(
-        teff, logg, feh, av, dist, lstar, 1.0, sedfile
-    )
-
-    # Read observed SED for wavelengths and errors
     from exozippy.sed.utils import read_sed_file
     sed_data = read_sed_file(sedfile, 1)
+
+    sedchi2, blendmag, modelflux, magresiduals = mistmultised(
+        teff, logg, feh, av, dist, lstar, 1.0, sedfile, sed_data=sed_data
+    )
     bands = sed_data['sedbands']
     obs_mag = sed_data['mag']
     obs_err = sed_data['errmag']
@@ -389,7 +395,8 @@ def plot_sed(priorfile, sedfile, bestfit=None, samples=None, outfile=None):
             s_lstar = _derive_lstar(s_teff, s_rstar)
             try:
                 _, s_bmag, _, _ = mistmultised(
-                    s_teff, s_logg, s_feh, s_av, s_dist, s_lstar, 1.0, sedfile
+                    s_teff, s_logg, s_feh, s_av, s_dist, s_lstar, 1.0, sedfile,
+                    sed_data=sed_data
                 )
                 posterior_fluxes[k, :] = (zp * 10**(-0.4 * s_bmag))[order]
             except Exception:

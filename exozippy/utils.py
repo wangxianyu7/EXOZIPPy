@@ -687,7 +687,7 @@ def exozippy_getb2_(
 #   2010/06 - Rewritten by Jason Eastman (OSU)
 # -------------------------------------------------------------------
 @njit
-def exozippy_getphase(
+def _exozippy_getphase_scalar(
     eccen,
     omega,
     trueanom=None,
@@ -699,8 +699,8 @@ def exozippy_getphase(
     ascendingnode=False,
     descendingnode=False
 ):
-    eccen = np.array(eccen, dtype=np.float64)
-    omega = np.array(omega, dtype=np.float64)
+    eccen = np.float64(eccen)
+    omega = np.float64(omega)
 
     # Handle common special-case phase positions
     if periastron:
@@ -736,6 +736,62 @@ def exozippy_getphase(
     return phase
 
 
+def exozippy_getphase(
+    eccen,
+    omega,
+    trueanom=None,
+    primary=False,
+    secondary=False,
+    l4=False,
+    l5=False,
+    periastron=False,
+    ascendingnode=False,
+    descendingnode=False
+):
+    """
+    Wrapper to support scalar or vector eccen/omega inputs.
+    """
+    eccen_arr = np.asarray(eccen, dtype=np.float64)
+    omega_arr = np.asarray(omega, dtype=np.float64)
+
+    if eccen_arr.ndim == 0 and omega_arr.ndim == 0:
+        return _exozippy_getphase_scalar(
+            float(eccen_arr.reshape(1)[0]),
+            float(omega_arr.reshape(1)[0]),
+            trueanom=trueanom,
+            primary=primary,
+            secondary=secondary,
+            l4=l4,
+            l5=l5,
+            periastron=periastron,
+            ascendingnode=ascendingnode,
+            descendingnode=descendingnode
+        )
+
+    if eccen_arr.shape != omega_arr.shape:
+        raise ValueError("eccen and omega must have the same shape")
+
+    n = eccen_arr.size
+    phase = np.empty_like(eccen_arr)
+    eccen_flat = eccen_arr.reshape(-1)
+    omega_flat = omega_arr.reshape(-1)
+    phase_flat = phase.reshape(-1)
+
+    for i in range(n):
+        phase_flat[i] = _exozippy_getphase_scalar(
+            float(eccen_flat[i]),
+            float(omega_flat[i]),
+            trueanom=trueanom,
+            primary=primary,
+            secondary=secondary,
+            l4=l4,
+            l5=l5,
+            periastron=periastron,
+            ascendingnode=ascendingnode,
+            descendingnode=descendingnode
+        )
+
+    return phase
 
 
 # ⚠️ Initial auto-translation from IDL (ChatGPT). Review required.
@@ -964,7 +1020,7 @@ def sqarea_triangle(z0, p0):
 
 # ⚠️ Initial auto-translation from IDL (ChatGPT). Review required.
 @njit
-def exozippy_occultquad_cel(z0, u1, u2, p0, return_coeffs=False):
+def _exozippy_occultquad_cel_scalar(z0, u1, u2, p0, return_coeffs=False):
     """
     Full translation of exozippy_OCCULTQUAD_CEL from IDL.
     Computes flux for quadratically limb-darkened occultation.
@@ -1266,3 +1322,51 @@ def exozippy_occultquad_cel(z0, u1, u2, p0, return_coeffs=False):
         else:
             d = np.empty((3, 1), dtype=np.float64)  # dummy placeholder
             return muo1, mu0, d
+
+
+def exozippy_occultquad_cel(z0, u1, u2, p0, return_coeffs=False):
+    """
+    Wrapper that supports scalar or vector p0/u1/u2 by looping over samples
+    when needed, while keeping the scalar core JIT-compiled.
+    """
+    z = np.asarray(z0, dtype=np.float64)
+    p = np.asarray(p0, dtype=np.float64)
+    u1_arr = np.asarray(u1, dtype=np.float64)
+    u2_arr = np.asarray(u2, dtype=np.float64)
+
+    if p.ndim == 0 or p.size == 1:
+        p_scalar = float(p.reshape(-1)[0])
+        return _exozippy_occultquad_cel_scalar(z, u1_arr, u2_arr, p_scalar, return_coeffs)
+
+    if z.size != p.size:
+        raise ValueError("p0 array must match z0 size for exozippy_occultquad_cel")
+
+    n = z.size
+    muo1 = np.empty(n, dtype=np.float64)
+    mu0 = np.empty(n, dtype=np.float64)
+    if return_coeffs:
+        d = np.empty((3, n), dtype=np.float64)
+    else:
+        d = np.empty((3, 1), dtype=np.float64)
+
+    u1_is_scalar = (u1_arr.ndim == 0 or u1_arr.size == 1)
+    u2_is_scalar = (u2_arr.ndim == 0 or u2_arr.size == 1)
+    u1_scalar = float(u1_arr.reshape(-1)[0]) if u1_is_scalar else 0.0
+    u2_scalar = float(u2_arr.reshape(-1)[0]) if u2_is_scalar else 0.0
+
+    for i in range(n):
+        u1_i = u1_scalar if u1_is_scalar else float(u1_arr[i])
+        u2_i = u2_scalar if u2_is_scalar else float(u2_arr[i])
+        muo1_i, mu0_i, d_i = _exozippy_occultquad_cel_scalar(
+            np.array([z[i]], dtype=np.float64),
+            u1_i,
+            u2_i,
+            float(p[i]),
+            return_coeffs
+        )
+        muo1[i] = muo1_i[0]
+        mu0[i] = mu0_i[0]
+        if return_coeffs:
+            d[:, i] = d_i[:, 0]
+
+    return muo1, mu0, d

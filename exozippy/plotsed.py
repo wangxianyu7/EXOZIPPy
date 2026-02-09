@@ -99,7 +99,7 @@ def _interp_atmosphere(teff, logg, feh):
     feh_ndx = np.clip(feh_ndx, 0, len(ALLOWED_FEH) - 2)
 
     # Path to NextGen models
-    nextgen_path = pathlib.Path(exozippy.MODULE_PATH) / 'EXOZIPPy' / 'exozippy' / 'sed' / 'nextgenfin'
+    nextgen_path = pathlib.Path(exozippy.NEXTGENFIN_PATH)
 
     # Load 8 corner models for trilinear interpolation
     lamflams = np.zeros((24000, 2, 2, 2))

@@ -18,7 +18,7 @@ from pathlib import Path
 from .read_par import read_par
 from .read_tran import read_tran
 from .read_rv import read_rv
-from .sed.utils import mistmultised
+from .sed.utils import mistmultised, read_sed_file
 from .exozippy_tran import exozippy_tran
 from .exozippy_rv import exozippy_rv
 
@@ -83,6 +83,9 @@ def build_simple_model(parfile=None,
             print(f"Found {len(rvfiles)} RV files")
         for rvfile in rvfiles:
             rv_data.append(read_rv(rvfile))
+
+    # Cache SED data once for repeated chi2 calls
+    sed_data = read_sed_file(sedfile, nstars) if sedfile is not None else None
     
     # Create event structure
     event = {
@@ -225,6 +228,7 @@ def build_simple_model(parfile=None,
                     lstar=np.atleast_1d(lstar),
                     errscale=np.atleast_1d(1.0),
                     sedfile=sedfile,
+                    sed_data=sed_data,
                     debug=False
                 )
                 

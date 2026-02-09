@@ -139,6 +139,64 @@ def ninterpolate(data, point):
     return value
 
 
+@njit(cache=True)
+def _ninterpolate4d(data, x, y, z, w):
+    """
+    Specialized 4-D multilinear interpolation (faster than generic loop).
+    data shape: (nx, ny, nz, nw)
+    """
+    x0 = int(np.floor(x)); y0 = int(np.floor(y)); z0 = int(np.floor(z)); w0 = int(np.floor(w))
+    fx = x - x0; fy = y - y0; fz = z - z0; fw = w - w0
+
+    nx, ny, nz, nw = data.shape
+    x1 = x0 + 1; y1 = y0 + 1; z1 = z0 + 1; w1 = w0 + 1
+
+    if x0 < 0: x0 = 0
+    if y0 < 0: y0 = 0
+    if z0 < 0: z0 = 0
+    if w0 < 0: w0 = 0
+    if x1 >= nx: x1 = nx - 1
+    if y1 >= ny: y1 = ny - 1
+    if z1 >= nz: z1 = nz - 1
+    if w1 >= nw: w1 = nw - 1
+
+    v0000 = data[x0, y0, z0, w0]
+    v1000 = data[x1, y0, z0, w0]
+    v0100 = data[x0, y1, z0, w0]
+    v1100 = data[x1, y1, z0, w0]
+    v0010 = data[x0, y0, z1, w0]
+    v1010 = data[x1, y0, z1, w0]
+    v0110 = data[x0, y1, z1, w0]
+    v1110 = data[x1, y1, z1, w0]
+    v0001 = data[x0, y0, z0, w1]
+    v1001 = data[x1, y0, z0, w1]
+    v0101 = data[x0, y1, z0, w1]
+    v1101 = data[x1, y1, z0, w1]
+    v0011 = data[x0, y0, z1, w1]
+    v1011 = data[x1, y0, z1, w1]
+    v0111 = data[x0, y1, z1, w1]
+    v1111 = data[x1, y1, z1, w1]
+
+    c000 = v0000 * (1.0 - fx) + v1000 * fx
+    c100 = v0100 * (1.0 - fx) + v1100 * fx
+    c010 = v0010 * (1.0 - fx) + v1010 * fx
+    c110 = v0110 * (1.0 - fx) + v1110 * fx
+    c001 = v0001 * (1.0 - fx) + v1001 * fx
+    c101 = v0101 * (1.0 - fx) + v1101 * fx
+    c011 = v0011 * (1.0 - fx) + v1011 * fx
+    c111 = v0111 * (1.0 - fx) + v1111 * fx
+
+    c00 = c000 * (1.0 - fy) + c100 * fy
+    c10 = c010 * (1.0 - fy) + c110 * fy
+    c01 = c001 * (1.0 - fy) + c101 * fy
+    c11 = c011 * (1.0 - fy) + c111 * fy
+
+    c0 = c00 * (1.0 - fz) + c10 * fz
+    c1 = c01 * (1.0 - fz) + c11 * fz
+
+    return c0 * (1.0 - fw) + c1 * fw
+
+
 @functools.lru_cache(maxsize=8)
 def _load_mist_grid(grid_path: str):
     """Read and cache mist.sed.grid.idl (grid definitions for the BC cubes)."""
@@ -152,8 +210,53 @@ def _load_bc_cube(bc_path: str):
     s = readsav(bc_path, python_dict=True)
     return s['bcarray'], s['filterproperties']
 
+@functools.lru_cache(maxsize=256)
+def _load_filter_curve(idl_path: str):
+    """Read and cache a filter transmission curve and metadata."""
+    filt = readsav(idl_path, python_dict=True)['filter']
+    transmission = filt['transmission'][0]
+    weff = filt['weff'][0]
+    widtheff = filt['widtheff'][0]
+    zero_point = filt['zero_point'][0]
+    curve_sum = np.sum(transmission)
+    return transmission, weff, widtheff, zero_point, curve_sum
+
+@functools.lru_cache(maxsize=4)
+def _load_filter_names(root_dir: str):
+    """Load and cache filter name mappings."""
+    filter_file = filepath('filternames2.txt', root_dir, ['EXOZIPPy','exozippy','sed', 'mist'])
+    return np.loadtxt(filter_file, dtype=str, comments="#", unpack=True)
+
+@functools.lru_cache(maxsize=32)
+def _load_bcarrays(bands_tuple, root_dir: str):
+    """Load and cache stacked BC arrays for a given band set."""
+    kname, mname, cname, svoname = _load_filter_names(root_dir)
+    root = pathlib.Path(root_dir) / 'EXOZIPPy' / 'exozippy' / 'sed' / 'mist'
+    bc_cubes, filterprops = [], []
+    for band in bands_tuple:
+        candidates = [band]
+        if band in kname:
+            candidates.append(mname[np.where(kname == band)[0][0]])
+        if band in svoname:
+            candidates.append(mname[np.where(svoname == band)[0][0]])
+
+        for cand in candidates:
+            bc_path = root / f"{cand}.idl"
+            if bc_path.exists():
+                bc, props = _load_bc_cube(str(bc_path))
+                bc = np.transpose(bc, (3, 2, 1, 0))
+                bc_cubes.append(bc)
+                filterprops.append(props)
+                break
+        else:
+            raise FileNotFoundError(f"{band} not supported – remove it from sed file")
+
+    bcarrays = np.stack(bc_cubes, axis=-1)  # (nteff, nlogg, nfeh, nav, nbands)
+    return bcarrays, filterprops
+
 def mistmultised(teff, logg, feh, av, distance, lstar, errscale, sedfile,
                   *,
+                  sed_data=None,
                   redo=False,
                   psname=None, debug=False, atmospheres=None,
                   wavelength=None, logname=None, xyrange=None,
@@ -192,7 +295,8 @@ def mistmultised(teff, logg, feh, av, distance, lstar, errscale, sedfile,
     err0 = float(np.atleast_1d(errscale)[0])
 
     # ---------- 2. Read observed SED file ---------------------------------
-    sed_data   = read_sed_file(sedfile, nstars, logname=logname)
+    if sed_data is None:
+        sed_data = read_sed_file(sedfile, nstars, logname=logname)
     sedbands   = sed_data['sedbands']
     mags       = sed_data['mag']
     errs       = sed_data['errmag']
@@ -204,32 +308,8 @@ def mistmultised(teff, logg, feh, av, distance, lstar, errscale, sedfile,
     gridfile = root / 'mist.sed.grid.idl'
     teffgrid, logggrid, fehgrid, avgrid = _load_mist_grid(str(gridfile))
 
-    # Filter mapping table
-    kname, mname, cname, svoname = np.loadtxt(
-        root / 'filternames2.txt', dtype=str, comments="#", unpack=True
-    )
-
-    bc_cubes, filterprops = [], []
-    for band in sedbands:
-        # Replicates the fallback order in the IDL code
-        candidates = [band]
-        if band in kname:
-            candidates.append(mname[np.where(kname == band)[0][0]])
-        if band in svoname:
-            candidates.append(mname[np.where(svoname == band)[0][0]])
-
-        for cand in candidates:
-            bc_path = root / f"{cand}.idl"
-            if bc_path.exists():
-                bc, props = _load_bc_cube(str(bc_path))     
-                bc = np.transpose(bc, (3, 2, 1, 0))
-                bc_cubes.append(bc)
-                filterprops.append(props)
-                break
-        else:
-            raise FileNotFoundError(f"{band} not supported – remove it from {sedfile}")
-
-    bcarrays = np.stack(bc_cubes, axis=-1)  # shape: (nteff, nlogg, nfeh, nav, nbands)
+    bands_tuple = tuple(str(b) for b in sedbands)
+    bcarrays, filterprops = _load_bcarrays(bands_tuple, str(exozippy.MODULE_PATH))
 
     if blend0 is not None:
         blend0[:] = blend.copy()
@@ -243,7 +323,12 @@ def mistmultised(teff, logg, feh, av, distance, lstar, errscale, sedfile,
                   (fehgrid,  feh[j]),
                   (avgrid,   av[j]))]
         for i in range(nbands):
-            bcs[i, j] = ninterpolate(bcarrays[..., i], coord)
+            if bcarrays[..., i].ndim == 4:
+                bcs[i, j] = _ninterpolate4d(
+                    bcarrays[..., i], coord[0], coord[1], coord[2], coord[3]
+                )
+            else:
+                bcs[i, j] = ninterpolate(bcarrays[..., i], coord)
     # ---------- 5. Model magnitudes / fluxes ------------------------------
     mu         = 5.0 * np.log10(distance) - 5.0         # (nstars,)
     logL_term  = -2.5 * np.log10(lstar)                 # (nstars,)
@@ -424,15 +509,9 @@ def read_sed_file(
     with open(sedfile, 'r') as f:
         lines = f.readlines()
 
-    # Load filter name mapping
+    # Load filter name mapping (cached)
     root_dir = exozippy.MODULE_PATH
-    filter_file = filepath('filternames2.txt', root_dir, ['EXOZIPPy','exozippy','sed', 'mist'])
-    keivanname, mistname, claretname, svoname = np.loadtxt(
-        filter_file,
-        dtype=str,
-        comments='#',
-        unpack=True,
-    )
+    keivanname, mistname, claretname, svoname = _load_filter_names(root_dir)
 
     for i, line in enumerate(lines):
         line = line.strip()
@@ -475,12 +554,12 @@ def read_sed_file(
             errmag[i] = 99.0
             continue
 
-        filter = (readsav(idlfile, python_dict=True))['filter']
-        filter_curves[i, :] = filter['transmission'][0]
-        weff[i] = filter['weff'][0]
-        widtheff[i] = filter['widtheff'][0]
-        zero_point[i] = filter['zero_point'][0]
-        filter_curve_sum[i] = np.sum(filter_curves[i, :])
+        transmission, w_eff, width_eff, zp, curve_sum = _load_filter_curve(str(idlfile))
+        filter_curves[i, :] = transmission
+        weff[i] = w_eff
+        widtheff[i] = width_eff
+        zero_point[i] = zp
+        filter_curve_sum[i] = curve_sum
 
         flux[i] = zero_point[i] * 10 ** (-0.4 * mag[i])
         errflux[i] = flux[i] * np.log(10) / 2.5 * errmag[i]

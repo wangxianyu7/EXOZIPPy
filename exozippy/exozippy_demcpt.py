@@ -1,1031 +1,837 @@
 """
-Python translation of EXOFAST_DEMCPT_MULTI.PRO
-Differential Evolution Markov Chain Monte Carlo with Parallel Tempering
+demcptv3.py — Differential Evolution MCMC with Parallel Tempering
 
-Translated from IDL implementation by Jason Eastman (EXOFASTv2)
-Python version for EXOZIPPy
+Python implementation of EXOFASTv2's exofast_demcpt_multi.pro
+(Eastman et al. 2013, 2019; ter Braak 2006; Ford 2006).
 
-Author: Python translation for EXOZIPPy
-Original: Jason Eastman
+Features over v2:
+  - Multiprocessing for parallel log-posterior evaluation
+  - HDF5 checkpoint save/load
+
+Usage
+-----
+    from exozippy.exozippy_demcptv3 import DEMCPTSampler
+
+    def log_posterior(theta):
+        return -0.5 * np.sum(theta**2)
+
+    sampler = DEMCPTSampler(log_posterior, ndim=5, nchains=20)
+    converged = sampler.run(p0=np.zeros(5), nsteps=50000, scale=np.ones(5)*0.1,
+                            nworkers=4)
+
+    sampler.save("chains.h5")
+    sampler2 = DEMCPTSampler.load("chains.h5", log_posterior)
+
+    print(sampler.summary())
+    flat = sampler.flatchain          # burn-in removed, bad chains discarded
+    logp = sampler.flatlog_prob
 """
 
 import numpy as np
-import time
-import threading
-from typing import Callable, Optional, Tuple, Dict, Any, List
-import pickle
+from multiprocessing import Pool
+from numba import njit
 import h5py
-from pathlib import Path
 
-class EXOZIPPyDEMCPT:
+
+# ---------------------------------------------------------------------------
+#  JIT-compiled diagnostic functions
+# ---------------------------------------------------------------------------
+
+@njit(cache=True)
+def _gelman_rubin(chains):
     """
-    Differential Evolution Markov Chain Monte Carlo with Parallel Tempering
-    
-    Python translation of the EXOFASTv2 DEMC-PT algorithm for robust 
-    parameter estimation and uncertainty quantification.
+    Gelman-Rubin statistic (Rhat) and independent draws (Tz)
+    following Ford 2006, equations 21-26.
+
+    Parameters
+    ----------
+    chains : ndarray, shape (nsteps, nchains, ndim)
+
+    Returns
+    -------
+    Rhat : ndarray (ndim,)   — eq 25: sqrt(V̂⁺ / W)
+    Tz   : ndarray (ndim,)   — eq 26: m*n * min(V̂⁺ / B, 1)
     """
-    
-    def __init__(self, 
-                 chi2func: Callable,
-                 bestpars: Dict[str, float],
-                 tofit: Optional[List[str]] = None,
-                 scale: Optional[Dict[str, float]] = None,
-                 nchains: int = 8,
-                 ntemps: int = 8,
-                 tf: float = 200.0,
-                 maxsteps: int = 100000,
-                 nthin: int = 1,
-                 maxtime: Optional[float] = None,
-                 maxgr: float = 1.01,
-                 mintz: int = 1000,
-                 burnndx: Optional[int] = None,
-                 dontstop: bool = False,
-                 nthreads: int = 1,
-                 stretch: bool = False,
-                 keephot: bool = False,
-                 logname: Optional[str] = None,
-                 debug: bool = False,
-                 seed: Optional[int] = None):
-        """
-        Initialize DEMC-PT sampler
-        
-        Parameters:
-        -----------
-        chi2func : callable
-            Function to calculate chi-squared given parameters
-        bestpars : dict
-            Dictionary of best-fit parameters
-        tofit : list, optional  
-            List of parameter names to fit
-        scale : dict, optional
-            Step sizes for each parameter
-        nchains : int
-            Number of independent chains per temperature
-        ntemps : int
-            Number of temperature levels
-        tf : float
-            Temperature factor for parallel tempering ladder
-        maxsteps : int
-            Maximum number of MCMC steps
-        nthin : int
-            Thinning factor for output
-        maxtime : float, optional
-            Maximum runtime in seconds
-        maxgr : float
-            Maximum Gelman-Rubin statistic for convergence
-        mintz : int
-            Minimum independent samples for convergence test
-        burnndx : int, optional
-            Burn-in index (auto-determined if None)
-        dontstop : bool
-            Continue even if converged
-        nthreads : int
-            Number of threads for parallel computation
-        stretch : bool
-            Use stretch move instead of differential evolution
-        keephot : bool
-            Keep only hottest temperature chain
-        logname : str, optional
-            Log file name
-        debug : bool
-            Enable debug output
-        seed : int, optional
-            Random seed
-        """
-        
-        self.chi2func = chi2func
-        self.bestpars = bestpars.copy()
-        self.nchains = nchains
+    nsteps, nchains, ndim = chains.shape
+    Rhat = np.empty(ndim)
+    Tz = np.empty(ndim)
+
+    for d in range(ndim):
+        # eq 20-21: per-chain mean and W(z)
+        chain_means = np.empty(nchains)
+        chain_vars = np.empty(nchains)
+        for c in range(nchains):
+            s = 0.0
+            for t in range(nsteps):
+                s += chains[t, c, d]
+            mu = s / nsteps
+            chain_means[c] = mu
+            v = 0.0
+            for t in range(nsteps):
+                diff = chains[t, c, d] - mu
+                v += diff * diff
+            chain_vars[c] = v / (nsteps - 1)
+
+        # W = mean within-chain variance (eq 21)
+        W = 0.0
+        for c in range(nchains):
+            W += chain_vars[c]
+        W /= nchains
+
+        # grand mean (eq 22)
+        grand = 0.0
+        for c in range(nchains):
+            grand += chain_means[c]
+        grand /= nchains
+
+        # variance of chain means
+        var_of_means = 0.0
+        for c in range(nchains):
+            diff = chain_means[c] - grand
+            var_of_means += diff * diff
+        var_of_means /= (nchains - 1)
+
+        # B(z) = n * var(chain_means)  (eq 23)
+        B = nsteps * var_of_means
+
+        # V̂⁺(z) = (n-1)/n * W + var_of_means  (eq 24)
+        Vplus = (nsteps - 1.0) / nsteps * W + var_of_means
+
+        # eq 25: Rhat
+        Rhat[d] = np.sqrt(Vplus / W) if W > 0 else np.inf
+
+        # eq 26: Tz = m * n * min(V̂⁺ / B, 1)
+        if B > 0:
+            ratio = Vplus / B
+            if ratio > 1.0:
+                ratio = 1.0
+            Tz[d] = nchains * nsteps * ratio
+        else:
+            Tz[d] = 0.0
+
+    return Rhat, Tz
+
+
+@njit(cache=True)
+def _find_burnin(neg2logp):
+    """
+    Burn-in index: the latest step at which any chain first crosses
+    below the median -2*logpost.
+
+    Parameters
+    ----------
+    neg2logp : ndarray (nsteps, nchains)
+
+    Returns
+    -------
+    burnin : int
+    """
+    nsteps, nchains = neg2logp.shape
+
+    # median via sort
+    flat = neg2logp.ravel().copy()
+    flat.sort()
+    n = len(flat)
+    median_val = (flat[n // 2 - 1] + flat[n // 2]) / 2.0 if n % 2 == 0 else flat[n // 2]
+
+    burn = 0
+    for c in range(nchains):
+        for t in range(nsteps):
+            if neg2logp[t, c] <= median_val:
+                if t > burn:
+                    burn = t
+                break
+    return burn
+
+
+@njit(cache=True)
+def _identify_good_chains(neg2logp):
+    """
+    Discard chains stuck in local minima.
+    A chain is "bad" if its median -2*logpost exceeds
+    (overall median of chain medians) + 5 * 1.4826 * MAD.
+
+    Parameters
+    ----------
+    neg2logp : ndarray (nsteps, nchains)
+
+    Returns
+    -------
+    good : int64 array of good chain indices
+    """
+    nsteps, nchains = neg2logp.shape
+
+    medians = np.empty(nchains)
+    for c in range(nchains):
+        col = neg2logp[:, c].copy()
+        col.sort()
+        n = len(col)
+        medians[c] = (col[n // 2 - 1] + col[n // 2]) / 2.0 if n % 2 == 0 else col[n // 2]
+
+    sm = medians.copy()
+    sm.sort()
+    n = len(sm)
+    overall = (sm[n // 2 - 1] + sm[n // 2]) / 2.0 if n % 2 == 0 else sm[n // 2]
+
+    devs = np.abs(medians - overall)
+    ds = devs.copy()
+    ds.sort()
+    mad = (ds[n // 2 - 1] + ds[n // 2]) / 2.0 if n % 2 == 0 else ds[n // 2]
+
+    threshold = overall + 5.0 * 1.4826 * mad
+
+    good = []
+    for c in range(nchains):
+        if medians[c] <= threshold:
+            good.append(c)
+    return np.array(good, dtype=np.int64)
+
+
+# ---------------------------------------------------------------------------
+#  Sampler
+# ---------------------------------------------------------------------------
+
+class DEMCPTSampler:
+    """
+    Differential Evolution MCMC with optional Parallel Tempering.
+
+    Parameters
+    ----------
+    log_posterior : callable
+        Function  theta(ndim,) -> float  returning log-posterior.
+    ndim : int
+    nchains : int, optional
+        Default max(2*ndim, 10).
+    ntemps : int, optional
+        Number of temperature rungs. 1 = no tempering.
+    Tf : float, optional
+        Temperature factor for the hottest rung (default 200).
+    stretch : bool, optional
+        Use stretch move instead of DE (default False).
+    maxgr : float, optional
+        Convergence threshold for Gelman-Rubin (default 1.01).
+    mintz : float, optional
+        Convergence threshold for independent draws (default 1000).
+    seed : int or None
+    """
+
+    def __init__(self, log_posterior, ndim, nchains=None, ntemps=1, Tf=200.0,
+                 stretch=False, maxgr=1.01, mintz=1000, seed=None):
+        self.logpost_func = log_posterior
+        self.ndim = ndim
+        self.nchains = nchains or max(2 * ndim, 3)
         self.ntemps = ntemps
-        self.tf = tf
-        self.maxsteps = maxsteps
-        self.nthin = nthin
-        self.maxtime = maxtime
+        self.stretch = stretch
         self.maxgr = maxgr
         self.mintz = mintz
-        self.burnndx = burnndx
-        self.dontstop = dontstop
-        self.nthreads = nthreads
-        self.stretch = stretch
-        self.keephot = keephot
-        self.logname = logname
-        self.debug = debug
-        
-        # Set random seed
-        if seed is not None:
-            np.random.seed(seed)
-            
-        # Determine which parameters to fit
-        if tofit is None:
-            self.tofit = list(bestpars.keys())
+        self.rng = np.random.default_rng(seed)
+
+        # temperature ladder  (betas[0]=1 cold, betas[-1]=1/Tf hot)
+        if ntemps > 1:
+            self.betas = (1.0 / Tf) ** (np.arange(ntemps) / (ntemps - 1))
         else:
-            self.tofit = tofit
-            
-        self.nfit = len(self.tofit)
-        
-        # Set up parameter scales
+            self.betas = np.array([1.0])
+
+        self.gamma = 2.38 / np.sqrt(2.0 * ndim)
+        self.a_stretch = 2.0
+
+        # results (populated by run)
+        self._chain = None
+        self._log_prob = None
+        self._pos_full = None     # (nchains, ntemps, ndim)
+        self._logp_full = None    # (nchains, ntemps)
+
+    # ----- proposal helpers --------------------------------------------------
+
+    def _de_proposals_batch(self, m, pos, scale):
+        """Generate DE proposals for ALL chains at temperature m."""
+        nc = self.nchains
+        ndim = self.ndim
+        rng = self.rng
+        proposals = np.empty((nc, ndim))
+        for j in range(nc):
+            pool = np.delete(np.arange(nc), j)
+            r1, r2 = rng.choice(pool, 2, replace=False)
+            jitter = (rng.random(ndim) - 0.5) * scale / 10.0
+            proposals[j] = (pos[j, m]
+                            + self.gamma * (pos[r1, m] - pos[r2, m] + jitter))
+        return proposals, np.zeros(nc)  # log_fac = 0 for all
+
+    def _stretch_proposals_batch(self, m, pos):
+        """Generate stretch-move proposals for ALL chains at temperature m."""
+        nc = self.nchains
+        ndim = self.ndim
+        rng = self.rng
+        a = self.a_stretch
+        proposals = np.empty((nc, ndim))
+        log_facs = np.empty(nc)
+        for j in range(nc):
+            r1 = rng.integers(0, nc - 1)
+            if r1 >= j:
+                r1 += 1
+            z = ((a - 1.0) * rng.random() + 1.0) ** 2 / a
+            proposals[j] = pos[r1, m] + z * (pos[j, m] - pos[r1, m])
+            log_facs[j] = (ndim - 1) * np.log(z)
+        return proposals, log_facs
+
+    # ----- main loop ---------------------------------------------------------
+
+    def run(self, p0, nsteps, nthin=1, scale=None, progress=True,
+            check_every=None, npass_required=6, nworkers=1,
+            save_every=0, save_file=None):
+        """
+        Run the sampler.
+
+        Parameters
+        ----------
+        p0 : ndarray (ndim,)
+            Best-fit starting point.
+        nsteps : int
+            Number of stored steps per chain.
+        nthin : int
+            Keep every nthin-th sample (default 1).
+        scale : ndarray (ndim,) or None
+            Per-parameter step scale.  If None, uses 1% of |p0|.
+        progress : bool
+            Print progress bar.
+        check_every : int or None
+            Steps between convergence checks.  Default nsteps//20.
+        npass_required : int
+            Consecutive passes needed (default 6).
+        nworkers : int
+            Number of worker processes for parallel logpost evaluation.
+            1 = serial (default).
+        save_every : int
+            Checkpoint to HDF5 every N steps. 0 = no checkpointing.
+        save_file : str or None
+            HDF5 file path for checkpointing. Required if save_every > 0.
+
+        Returns
+        -------
+        converged : bool
+        """
+        ndim = self.ndim
+        nchains = self.nchains
+        ntemps = self.ntemps
+        betas = self.betas
+        rng = self.rng
+        logpost = self.logpost_func
+
+        p0 = np.asarray(p0, dtype=np.float64)
         if scale is None:
-            self.scale = {key: 0.01 for key in self.tofit}
-        else:
-            self.scale = scale.copy()
-            
-        # Temperature ladder
-        self.temps = self.tf ** (np.arange(self.ntemps) / (self.ntemps - 1))
-        self.betas = 1.0 / self.temps
-        
-        # Initialize storage arrays
-        self.pars = np.zeros((self.ntemps, self.nchains, self.nfit, self.maxsteps))
-        self.chi2 = np.full((self.ntemps, self.nchains, self.maxsteps), np.inf)
-        self.lnprob = np.zeros((self.ntemps, self.nchains, self.maxsteps))
-        
-        # Tracking variables
-        self.naccept = np.zeros((self.ntemps, self.nchains))
-        self.nswap = np.zeros(self.ntemps - 1)
-        self.nswaptries = np.zeros(self.ntemps - 1)
-        self.tz = 0
-        self.converged = False
-        
-        # Threading setup
-        if self.nthreads > 1:
-            self.use_threading = True
-        else:
-            self.use_threading = False
-            
-    def initialize_chains(self) -> None:
-        """Initialize all chains with random starting positions"""
-        
-        if self.debug:
-            print(f"Initializing {self.ntemps} temperatures × {self.nchains} chains")
-            
-        # Convert bestpars to array for easier manipulation
-        self.bestpars_array = np.array([self.bestpars[key] for key in self.tofit])
-        
-        for t in range(self.ntemps):
-            for c in range(self.nchains):
-                # Random starting position around best fit
-                for i, key in enumerate(self.tofit):
-                    scale = self.scale[key]
-                    self.pars[t, c, i, 0] = (self.bestpars[key] + 
-                                           np.random.normal(0, scale))
-                
-                # Calculate initial chi-squared
-                pars_dict = {self.tofit[i]: self.pars[t, c, i, 0] 
-                           for i in range(self.nfit)}
-                self.chi2[t, c, 0] = self.chi2func(pars_dict)
-                self.lnprob[t, c, 0] = -0.5 * self.chi2[t, c, 0] * self.betas[t]
-                
-    def differential_evolution_step(self, temp: int, chain: int, step: int) -> Tuple[np.ndarray, bool]:
-        """
-        Generate proposal using differential evolution
-        
-        Parameters:
-        -----------
-        temp : int
-            Temperature index
-        chain : int
-            Chain index  
-        step : int
-            Current step
-            
-        Returns:
-        --------
-        proposal : ndarray
-            Proposed parameters
-        valid : bool
-            Whether proposal is valid
-        """
-        
-        current_pars = self.pars[temp, chain, :, step-1]
-        
-        if self.stretch:
-            # Affine invariant stretch move
-            # Choose random chain (not current one)
-            other_chains = [c for c in range(self.nchains) if c != chain]
-            other_chain = np.random.choice(other_chains)
-            other_pars = self.pars[temp, other_chain, :, step-1]
-            
-            # Generate stretch factor
-            a = 2.0  # stretch parameter
-            z = ((a - 1.0) * np.random.random() + 1.0) ** 2 / a
-            
-            proposal = other_pars + z * (current_pars - other_pars)
-            
-        else:
-            # Differential evolution
-            # Choose two random chains (different from current)
-            other_chains = [c for c in range(self.nchains) if c != chain]
-            if len(other_chains) < 2:
-                return current_pars, False
-                
-            chain1, chain2 = np.random.choice(other_chains, 2, replace=False)
-            
-            # DE/rand/1 scheme
-            gamma = 2.38 / np.sqrt(2 * self.nfit)  # Optimal scaling
-            pars1 = self.pars[temp, chain1, :, step-1] 
-            pars2 = self.pars[temp, chain2, :, step-1]
-            
-            proposal = current_pars + gamma * (pars1 - pars2)
-            
-            # Add random perturbation to avoid getting stuck (increased for better exploration)
-            for i in range(self.nfit):
-                proposal[i] += np.random.normal(0, self.scale[self.tofit[i]] * 0.1)
-        
-        return proposal, True
-    
-    def evaluate_chi2(self, pars_array: np.ndarray) -> float:
-        """
-        Evaluate chi-squared for parameter array
-        
-        Parameters:
-        -----------
-        pars_array : ndarray
-            Parameter values
-            
-        Returns:
-        --------
-        chi2 : float
-            Chi-squared value
-        """
-        
-        pars_dict = {self.tofit[i]: pars_array[i] for i in range(self.nfit)}
-        return self.chi2func(pars_dict)
-    
-    def metropolis_hastings_step(self, temp: int, chain: int, step: int) -> None:
-        """
-        Perform Metropolis-Hastings accept/reject step
-        
-        Parameters:
-        -----------
-        temp : int
-            Temperature index
-        chain : int
-            Chain index
-        step : int
-            Current step
-        """
-        
-        # Generate proposal
-        proposal, valid = self.differential_evolution_step(temp, chain, step)
-        
-        if not valid:
-            # Keep current state
-            self.pars[temp, chain, :, step] = self.pars[temp, chain, :, step-1]
-            self.chi2[temp, chain, step] = self.chi2[temp, chain, step-1]
-            self.lnprob[temp, chain, step] = self.lnprob[temp, chain, step-1]
-            return
-            
-        # Evaluate proposal
-        proposal_chi2 = self.evaluate_chi2(proposal)
-        proposal_lnprob = -0.5 * proposal_chi2 * self.betas[temp]
-        
-        # Metropolis-Hastings ratio
-        current_lnprob = self.lnprob[temp, chain, step-1]
-        ln_alpha = proposal_lnprob - current_lnprob
-        
-        # Accept/reject
-        if ln_alpha > 0 or np.log(np.random.random()) < ln_alpha:
-            # Accept
-            self.pars[temp, chain, :, step] = proposal
-            self.chi2[temp, chain, step] = proposal_chi2
-            self.lnprob[temp, chain, step] = proposal_lnprob
-            self.naccept[temp, chain] += 1
-        else:
-            # Reject - keep current state
-            self.pars[temp, chain, :, step] = self.pars[temp, chain, :, step-1]
-            self.chi2[temp, chain, step] = self.chi2[temp, chain, step-1]
-            self.lnprob[temp, chain, step] = self.lnprob[temp, chain, step-1]
-    
-    def parallel_tempering_swap(self, step: int) -> None:
-        """
-        Attempt parallel tempering swaps between adjacent temperatures
-        
-        Parameters:
-        -----------
-        step : int
-            Current step
-        """
-        
-        for t in range(self.ntemps - 1):
-            # Randomly select chain to swap
-            chain = np.random.randint(self.nchains)
-            
-            self.nswaptries[t] += 1
-            
-            # Calculate swap probability
-            chi2_cold = self.chi2[t, chain, step]
-            chi2_hot = self.chi2[t+1, chain, step]
-            
-            delta_beta = self.betas[t] - self.betas[t+1]
-            ln_swap_prob = delta_beta * (chi2_hot - chi2_cold) / 2.0
-            
-            # Accept swap?
-            if ln_swap_prob > 0 or np.log(np.random.random()) < ln_swap_prob:
-                # Swap states
-                self.pars[t, chain, :, step], self.pars[t+1, chain, :, step] = \
-                    self.pars[t+1, chain, :, step].copy(), self.pars[t, chain, :, step].copy()
-                    
-                self.chi2[t, chain, step], self.chi2[t+1, chain, step] = \
-                    self.chi2[t+1, chain, step], self.chi2[t, chain, step]
-                    
-                self.lnprob[t, chain, step], self.lnprob[t+1, chain, step] = \
-                    self.lnprob[t+1, chain, step], self.lnprob[t, chain, step]
-                    
-                self.nswap[t] += 1
-    
-    def gelman_rubin_test(self, step: int) -> Tuple[float, int]:
-        """
-        Calculate Gelman-Rubin convergence diagnostic
-        
-        Parameters:
-        -----------
-        step : int
-            Current step
-            
-        Returns:
-        --------
-        max_gr : float
-            Maximum G-R statistic across parameters
-        tz : int
-            Number of independent samples
-        """
-        
-        if step < 100:
-            return np.inf, 0
-            
-        # Use cold temperature chains only
-        temp = 0
-        
-        # Calculate for each parameter
-        gr_stats = []
-        
-        for param_idx in range(self.nfit):
-            chains_data = self.pars[temp, :, param_idx, :step+1]
-            
-            # Skip if insufficient data
-            if step < 50:
-                gr_stats.append(np.inf)
-                continue
-                
-            # Calculate between and within chain variance
-            chain_means = np.mean(chains_data, axis=1)
-            overall_mean = np.mean(chain_means)
-            
-            # Between chain variance
-            B = step * np.var(chain_means, ddof=1)
-            
-            # Within chain variance
-            chain_vars = np.var(chains_data, axis=1, ddof=1)
-            W = np.mean(chain_vars)
-            
-            # Gelman-Rubin statistic
-            if W > 0:
-                gr = np.sqrt(((step - 1) * W + B) / (step * W))
-            else:
-                gr = np.inf
-                
-            gr_stats.append(gr)
-        
-        max_gr = np.max(gr_stats) if gr_stats else np.inf
-        
-        # Estimate number of independent samples
-        tz = min(step // 2, int(step / max_gr)) if max_gr > 1 else step
-        
-        return max_gr, tz
-    
-    def run(self) -> Dict[str, Any]:
-        """
-        Run the MCMC sampler
-        
-        Returns:
-        --------
-        results : dict
-            Dictionary containing chains, chi2 values, and metadata
-        """
-        
-        start_time = time.time()
-        
-        # Initialize chains
-        self.initialize_chains()
-        
-        if self.debug:
-            print(f"Starting MCMC with {self.ntemps} temperatures, {self.nchains} chains")
-            print(f"Temperature ladder: {self.temps}")
-            
-        # Main MCMC loop
-        for step in range(1, self.maxsteps):
-            
-            # MCMC steps for all chains
-            if self.use_threading and self.nthreads > 1:
-                # Threaded execution
-                threads = []
-                for t in range(self.ntemps):
-                    for c in range(self.nchains):
-                        thread = threading.Thread(
-                            target=self.metropolis_hastings_step,
-                            args=(t, c, step)
-                        )
-                        threads.append(thread)
-                        thread.start()
-                        
-                        # Limit concurrent threads
-                        if len(threads) >= self.nthreads:
-                            for thread in threads:
-                                thread.join()
-                            threads = []
-                            
-                # Wait for remaining threads
-                for thread in threads:
-                    thread.join()
-            else:
-                # Sequential execution
-                for t in range(self.ntemps):
-                    for c in range(self.nchains):
-                        self.metropolis_hastings_step(t, c, step)
-            
-            # Parallel tempering swaps
-            if step % 10 == 0:  # Swap every 10 steps
-                self.parallel_tempering_swap(step)
-            
-            # Check convergence
-            if step % 100 == 0:
-                max_gr, tz = self.gelman_rubin_test(step)
-                self.tz = tz
-                
-                if self.debug and step % 1000 == 0:
-                    elapsed = time.time() - start_time
-                    accept_rate = np.mean(self.naccept[:, :] / step) * 100
-                    swap_rate = np.mean(self.nswap / np.maximum(self.nswaptries, 1)) * 100
-                    
-                    # Find best (minimum) chi² across all chains and temperatures up to current step
-                    best_chi2 = np.min(self.chi2[:, :, :step+1])
-                    
-                    print(f"Step {step:6d}: G-R = {max_gr:.4f}, "
-                          f"tz = {tz:4d}, accept = {accept_rate:.1f}%, "
-                          f"swap = {swap_rate:.1f}%, time = {elapsed:.1f}s, "
-                          f"best_chi2 = {best_chi2:.2f}")
-                
-                # Check convergence
-                if not self.dontstop and max_gr < self.maxgr and tz > self.mintz:
-                    if self.debug:
-                        print(f"Converged at step {step}")
-                    self.converged = True
-                    break
-                    
-                # Check time limit
-                if self.maxtime and (time.time() - start_time) > self.maxtime:
-                    if self.debug:
-                        print(f"Time limit reached at step {step}")
-                    break
-        
-        # Determine burn-in
-        if self.burnndx is None:
-            self.burnndx = max(step // 4, 100)  # Burn first 25% or 100 steps
-            
-        # Prepare results
-        final_step = min(step, self.maxsteps - 1)
-        
-        results = {
-            'pars': self.pars[:, :, :, :final_step+1],
-            'chi2': self.chi2[:, :, :final_step+1],
-            'lnprob': self.lnprob[:, :, :final_step+1],
-            'tofit': self.tofit,
-            'temps': self.temps,
-            'betas': self.betas,
-            'nsteps': final_step + 1,
-            'burnndx': self.burnndx,
-            'converged': self.converged,
-            'tz': self.tz,
-            'max_gr': max_gr if 'max_gr' in locals() else np.inf,
-            'naccept': self.naccept,
-            'nswap': self.nswap,
-            'nswaptries': self.nswaptries,
-            'runtime': time.time() - start_time
-        }
-        
-        if self.debug:
-            print(f"MCMC completed in {results['runtime']:.1f} seconds")
-            print(f"Final acceptance rate: {np.mean(self.naccept / final_step * 100):.1f}%")
-            
-        return results
-    
-    def save_chains(self, filename: str, format: str = 'hdf5') -> None:
-        """
-        Save MCMC chains to file
-        
-        Parameters:
-        -----------
-        filename : str
-            Output filename
-        format : str
-            File format ('hdf5', 'npz', 'pickle')
-        """
-        
-        # Prepare data to save
-        save_data = {
-            'pars': self.pars,
-            'chi2': self.chi2,
-            'lnprob': self.lnprob,
-            'tofit': self.tofit,
-            'temps': self.temps,
-            'betas': self.betas,
-            'burnndx': self.burnndx,
-            'converged': self.converged,
-            'tz': self.tz,
-            'naccept': self.naccept,
-            'nswap': self.nswap,
-            'nswaptries': self.nswaptries,
-            'bestpars': self.bestpars,
-            'scale': self.scale,
-            'maxsteps': self.maxsteps,
-            'nchains': self.nchains,
-            'ntemps': self.ntemps
-        }
-        
-        filepath = Path(filename)
-        
-        if format.lower() == 'hdf5':
-            self._save_hdf5(filepath.with_suffix('.h5'), save_data)
-        elif format.lower() == 'npz':
-            self._save_npz(filepath.with_suffix('.npz'), save_data)
-        elif format.lower() == 'pickle':
-            self._save_pickle(filepath.with_suffix('.pkl'), save_data)
-        else:
-            raise ValueError(f"Unsupported format: {format}")
-            
-        if self.debug:
-            print(f"Chains saved to {filepath}")
-    
-    def _save_hdf5(self, filepath: Path, data: Dict) -> None:
-        """Save to HDF5 format (recommended for large chains)"""
-        with h5py.File(filepath, 'w') as f:
-            # Save arrays
-            f.create_dataset('pars', data=data['pars'], compression='gzip')
-            f.create_dataset('chi2', data=data['chi2'], compression='gzip')  
-            f.create_dataset('lnprob', data=data['lnprob'], compression='gzip')
-            f.create_dataset('temps', data=data['temps'])
-            f.create_dataset('betas', data=data['betas'])
-            f.create_dataset('naccept', data=data['naccept'])
-            f.create_dataset('nswap', data=data['nswap'])
-            f.create_dataset('nswaptries', data=data['nswaptries'])
-            
-            # Save scalars
-            f.attrs['burnndx'] = data['burnndx']
-            f.attrs['converged'] = data['converged'] 
-            f.attrs['tz'] = data['tz']
-            f.attrs['maxsteps'] = data['maxsteps']
-            f.attrs['nchains'] = data['nchains']
-            f.attrs['ntemps'] = data['ntemps']
-            
-            # Save string lists and dicts
-            f.create_dataset('tofit', data=[s.encode() for s in data['tofit']])
-            
-            # Save parameter dictionaries
-            bestpars_grp = f.create_group('bestpars')
-            for key, val in data['bestpars'].items():
-                bestpars_grp.attrs[key] = val
-                
-            scale_grp = f.create_group('scale')  
-            for key, val in data['scale'].items():
-                scale_grp.attrs[key] = val
-    
-    def _save_npz(self, filepath: Path, data: Dict) -> None:
-        """Save to NumPy NPZ format"""
-        # Convert string lists and dicts to saveable format
-        tofit_array = np.array(data['tofit'], dtype='U50')
-        bestpars_keys = np.array(list(data['bestpars'].keys()), dtype='U50')
-        bestpars_vals = np.array(list(data['bestpars'].values()))
-        scale_keys = np.array(list(data['scale'].keys()), dtype='U50') 
-        scale_vals = np.array(list(data['scale'].values()))
-        
-        np.savez_compressed(
-            filepath,
-            pars=data['pars'],
-            chi2=data['chi2'],
-            lnprob=data['lnprob'],
-            temps=data['temps'],
-            betas=data['betas'],
-            tofit=tofit_array,
-            bestpars_keys=bestpars_keys,
-            bestpars_vals=bestpars_vals,
-            scale_keys=scale_keys,
-            scale_vals=scale_vals,
-            naccept=data['naccept'],
-            nswap=data['nswap'],
-            nswaptries=data['nswaptries'],
-            burnndx=data['burnndx'],
-            converged=data['converged'],
-            tz=data['tz'],
-            maxsteps=data['maxsteps'],
-            nchains=data['nchains'],
-            ntemps=data['ntemps']
-        )
-    
-    def _save_pickle(self, filepath: Path, data: Dict) -> None:
-        """Save to Pickle format (preserves all Python objects)"""
-        with open(filepath, 'wb') as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            scale = np.abs(p0) * 0.01
+            scale[scale == 0] = 1e-5
 
+        if check_every is None:
+            check_every = max(100, nsteps // 20)
 
-def load_chains(filename: str) -> Dict[str, Any]:
-    """
-    Load MCMC chains from file
-    
-    Parameters:
-    -----------
-    filename : str
-        Input filename
-        
-    Returns:
-    --------
-    data : dict
-        Loaded chain data
-    """
-    
-    filepath = Path(filename)
-    
-    if filepath.suffix == '.h5':
-        return _load_hdf5(filepath)
-    elif filepath.suffix == '.npz':
-        return _load_npz(filepath)
-    elif filepath.suffix == '.pkl':
-        return _load_pickle(filepath)
-    else:
-        # Try to auto-detect
-        if filepath.with_suffix('.h5').exists():
-            return _load_hdf5(filepath.with_suffix('.h5'))
-        elif filepath.with_suffix('.npz').exists():
-            return _load_npz(filepath.with_suffix('.npz'))
-        elif filepath.with_suffix('.pkl').exists():
-            return _load_pickle(filepath.with_suffix('.pkl'))
-        else:
-            raise FileNotFoundError(f"No chain file found for {filename}")
+        if save_every > 0 and save_file is None:
+            raise ValueError("save_file is required when save_every > 0")
 
+        use_pool = nworkers > 1
 
-def _load_hdf5(filepath: Path) -> Dict[str, Any]:
-    """Load from HDF5 format"""
-    with h5py.File(filepath, 'r') as f:
-        data = {}
-        
-        # Load arrays
-        data['pars'] = f['pars'][:]
-        data['chi2'] = f['chi2'][:]
-        data['lnprob'] = f['lnprob'][:]
-        data['temps'] = f['temps'][:]
-        data['betas'] = f['betas'][:]
-        data['naccept'] = f['naccept'][:]
-        data['nswap'] = f['nswap'][:]
-        data['nswaptries'] = f['nswaptries'][:]
-        
-        # Load scalars
-        data['burnndx'] = f.attrs['burnndx']
-        data['converged'] = f.attrs['converged']
-        data['tz'] = f.attrs['tz']
-        data['maxsteps'] = f.attrs['maxsteps'] 
-        data['nchains'] = f.attrs['nchains']
-        data['ntemps'] = f.attrs['ntemps']
-        
-        # Load string lists
-        data['tofit'] = [s.decode() for s in f['tofit'][:]]
-        
-        # Load parameter dictionaries
-        data['bestpars'] = dict(f['bestpars'].attrs)
-        data['scale'] = dict(f['scale'].attrs)
-        
-    return data
+        # ---- initialise walkers (nchains, ntemps, ndim) ---------------------
+        pos = np.empty((nchains, ntemps, ndim))
+        logp = np.full((nchains, ntemps), -np.inf)
 
+        if progress:
+            print(f"Initialising {nchains} chains x {ntemps} temps ...")
 
-def _load_npz(filepath: Path) -> Dict[str, Any]:
-    """Load from NumPy NPZ format"""
-    with np.load(filepath) as f:
-        data = {}
-        
-        # Load arrays
-        data['pars'] = f['pars']
-        data['chi2'] = f['chi2']
-        data['lnprob'] = f['lnprob']
-        data['temps'] = f['temps']
-        data['betas'] = f['betas']
-        data['naccept'] = f['naccept']
-        data['nswap'] = f['nswap']
-        data['nswaptries'] = f['nswaptries']
-        
-        # Load scalars
-        data['burnndx'] = int(f['burnndx'])
-        data['converged'] = bool(f['converged'])
-        data['tz'] = int(f['tz'])
-        data['maxsteps'] = int(f['maxsteps'])
-        data['nchains'] = int(f['nchains'])
-        data['ntemps'] = int(f['ntemps'])
-        
-        # Load parameter lists and dicts
-        data['tofit'] = f['tofit'].tolist()
-        data['bestpars'] = dict(zip(f['bestpars_keys'], f['bestpars_vals']))
-        data['scale'] = dict(zip(f['scale_keys'], f['scale_vals']))
-        
-    return data
+        # initialise with pool if available
+        for j in range(nchains):
+            for m in range(ntemps):
+                niter = 0
+                while True:
+                    if j == 0 and niter == 0:
+                        trial = p0.copy()
+                    else:
+                        factor = min(np.sqrt(500.0 / ndim), 3.0)
+                        trial = p0 + (factor / np.exp(niter / 1000.0)
+                                      * scale * rng.standard_normal(ndim))
+                    lp = logpost(trial)
+                    if np.isfinite(lp):
+                        pos[j, m] = trial
+                        logp[j, m] = lp
+                        break
+                    niter += 1
+                    if niter > 10000:
+                        raise RuntimeError(
+                            f"Cannot find finite logpost near p0 "
+                            f"(chain {j}, temp {m})")
 
+        # ---- storage (cold chain only) -------------------------------------
+        chain = np.empty((nsteps, nchains, ndim))
+        log_prob = np.empty((nsteps, nchains))
+        chain[0] = pos[:, 0]
+        log_prob[0] = logp[:, 0]
 
-def _load_pickle(filepath: Path) -> Dict[str, Any]:
-    """Load from Pickle format"""
-    with open(filepath, 'rb') as f:
-        return pickle.load(f)
-
-
-def exozippy_demcpt(chi2func: Callable,
-                    bestpars: Dict[str, float],
-                    backend: str = 'exozippy',
-                    **kwargs) -> Dict[str, Any]:
-    """
-    Convenience function for running MCMC with different backends
-    
-    Parameters:
-    -----------
-    chi2func : callable
-        Function to calculate chi-squared
-    bestpars : dict
-        Best-fit parameters
-    backend : str
-        MCMC backend to use ('exozippy' or 'emcee')
-    **kwargs
-        Additional arguments passed to the sampler
-        
-    Returns:
-    --------
-    results : dict
-        MCMC results
-    """
-    
-    if backend.lower() == 'emcee':
-        return _run_emcee_de(chi2func, bestpars, **kwargs)
-    else:
-        sampler = EXOZIPPyDEMCPT(chi2func, bestpars, **kwargs)
-        return sampler.run()
-
-
-def _run_emcee_de(chi2func: Callable,
-                  bestpars: Dict[str, float],
-                  nchains: int = 32, 
-                  maxsteps: int = 10000,
-                  scale: Dict[str, float] = None, 
-                  debug: bool = False, 
-                  seed: int = None,
-                  **kwargs) -> Dict[str, Any]:
-    """
-    Run MCMC using emcee with Differential Evolution moves
-    
-    Parameters:
-    -----------
-    chi2func : callable
-        Function that calculates chi-squared given parameter dictionary
-    bestpars : dict
-        Dictionary of best-fit parameters
-    nchains : int
-        Number of walkers (chains)
-    maxsteps : int
-        Maximum number of steps
-    scale : dict
-        Parameter step sizes (used for walker initialization)
-    debug : bool
-        Enable debug output
-    seed : int
-        Random seed
-    **kwargs : dict
-        Additional arguments (ignored for emcee compatibility)
-        
-    Returns:
-    --------
-    results : dict
-        MCMC results in EXOZIPPy-compatible format
-    """
-    
-    try:
-        import emcee
-        from emcee.moves import DEMove
-    except ImportError:
-        raise ImportError("emcee is required for the 'emcee' backend. Install with: pip install emcee")
-    
-    import numpy as np
-    import time
-    
-    if seed is not None:
-        np.random.seed(seed)
-    
-    # Convert bestpars to arrays for emcee
-    tofit = list(bestpars.keys())
-    ndim = len(tofit)
-    
-    def log_prob(pars_array):
-        """Convert chi2 to log probability for emcee"""
-        pars_dict = {tofit[i]: pars_array[i] for i in range(ndim)}
-        try:
-            chi2 = chi2func(pars_dict)
-            return -0.5 * chi2
-        except:
-            return -np.inf
-    
-    # Initialize walker positions around best fit
-    if scale is None:
-        # Default scale - 1% of parameter value
-        scale = {param: abs(val) * 0.01 if val != 0 else 0.01 
-                for param, val in bestpars.items()}
-    
-    # Convert to array format
-    bestpars_array = np.array([bestpars[param] for param in tofit])
-    scale_array = np.array([scale.get(param, 0.01) for param in tofit])
-    
-    # Initialize walkers with small perturbations around best fit
-    pos = bestpars_array + np.random.normal(0, scale_array, (nchains, ndim))
-    
-    # Set up emcee with DE moves
-    moves = [DEMove()]  # Use Differential Evolution moves
-    sampler = emcee.EnsembleSampler(nchains, ndim, log_prob, moves=moves)
-    
-    if debug:
-        print(f"Starting emcee MCMC with {nchains} walkers, {ndim} parameters")
-        print(f"Using Differential Evolution moves")
-    
-    start_time = time.time()
-    
-    # Initialize variables for convergence tracking
-    autocorr_times = []
-    
-    # Run MCMC with emcee's built-in progress bar
-    if debug:
-        print("Running MCMC with autocorrelation-based convergence monitoring...")
-        
-        # We'll implement our own progress monitoring with autocorr analysis
-        old_tau = np.inf
+        naccept = 0
+        nattempt = 0
+        nswap = 0
+        nswap_attempt = 0
+        npass = 0
         converged = False
-        
-        # Start MCMC
-        for sample in sampler.sample(pos, iterations=maxsteps, progress=True):
-            # Check convergence every 1000 steps
-            if sampler.iteration % 1000:
-                continue
-                
-            # Compute the autocorrelation time so far
-            try:
-                tau = sampler.get_autocorr_time(tol=0)
-                autocorr_times.append(tau.copy())
-                
-                # Check convergence - we need:
-                # 1. Chain length > 50 * tau
-                # 2. tau hasn't changed much
-                converged_chain_length = np.all(sampler.iteration > 50 * tau)
-                converged_tau_stable = np.all(np.abs(old_tau - tau) / tau < 0.01)
-                
-                if converged_chain_length and converged_tau_stable:
-                    converged = True
-                    if debug:
-                        print(f"\n🎉 Convergence achieved at step {sampler.iteration}!")
-                        print(f"   Autocorr times: {tau}")
-                        print(f"   Chain length / tau: {sampler.iteration / np.max(tau):.1f}")
+        final_step = nsteps
+        last_saved = None
+
+        if progress:
+            workers_s = f" ({nworkers} workers)" if use_pool else ""
+            print(f"Running MCMC{workers_s} ...")
+
+        # ---- MCMC loop ------------------------------------------------------
+        pool = Pool(nworkers) if use_pool else None
+        try:
+            for i in range(1, nsteps):
+                for _thin in range(nthin):
+                    for m in range(ntemps):
+
+                        # --- parallel-tempering swap (sequential, cheap) -----
+                        if m < ntemps - 1:
+                            for j in range(nchains):
+                                if rng.random() < 0.5:
+                                    nswap_attempt += 1
+                                    log_alpha = ((betas[m] - betas[m + 1])
+                                                 * (logp[j, m + 1] - logp[j, m]))
+                                    if np.log(rng.random()) < log_alpha:
+                                        nswap += 1
+                                        pos[j, m], pos[j, m + 1] = (
+                                            pos[j, m + 1].copy(), pos[j, m].copy())
+                                        logp[j, m], logp[j, m + 1] = (
+                                            logp[j, m + 1], logp[j, m])
+
+                        # --- generate ALL proposals for this temp level ------
+                        if self.stretch:
+                            proposals, log_facs = self._stretch_proposals_batch(
+                                m, pos)
+                        else:
+                            proposals, log_facs = self._de_proposals_batch(
+                                m, pos, scale)
+
+                        # --- evaluate logpost in parallel --------------------
+                        nattempt += nchains
+                        if pool is not None:
+                            new_lps = np.array(pool.map(logpost, list(proposals)))
+                        else:
+                            new_lps = np.array([logpost(proposals[j])
+                                                for j in range(nchains)])
+
+                        # --- accept/reject -----------------------------------
+                        for j in range(nchains):
+                            if np.isfinite(new_lps[j]):
+                                log_alpha = (betas[m] * (new_lps[j] - logp[j, m])
+                                             + log_facs[j])
+                                if np.log(rng.random()) < log_alpha:
+                                    naccept += 1
+                                    pos[j, m] = proposals[j]
+                                    logp[j, m] = new_lps[j]
+
+                    # store cold chain
+                    chain[i] = pos[:, 0]
+                    log_prob[i] = logp[:, 0]
+
+                # --- checkpoint ----------------------------------------------
+                if save_every > 0 and (i + 1) % save_every == 0:
+                    self._chain = chain[:i + 1]
+                    self._log_prob = log_prob[:i + 1]
+                    self._pos_full = pos
+                    self._logp_full = logp
+                    self.save(save_file)
+                    last_saved = i + 1
+                    if progress:
+                        pct = 100 * (i + 1) / nsteps
+                        acc = naccept / max(nattempt, 1) * 100
+                        swap_s = ""
+                        if ntemps > 1 and nswap_attempt > 0:
+                            swap_s = f"; swap={nswap / nswap_attempt * 100:.1f}%"
+                        print(f"\n  Checkpoint saved at step {i + 1}.")
+                        print(f"\r  {pct:5.1f}% | accept={acc:.1f}%{swap_s}   ",
+                              end="", flush=True)
+
+                # --- convergence check ---------------------------------------
+                if (i + 1) % check_every == 0 and i > 2 * nchains:
+                    chi2 = -2.0 * log_prob[:i + 1]
+                    burnndx = _find_burnin(chi2)
+                    post_burn = chain[burnndx:i + 1]
+
+                    if post_burn.shape[0] > 10:
+                        Rhat, Tz = _gelman_rubin(post_burn)
+                        max_gr = float(np.max(Rhat))
+                        min_tz = float(np.min(Tz))
+
+                        acc = naccept / max(nattempt, 1) * 100
+                        swap_s = ""
+                        if ntemps > 1 and nswap_attempt > 0:
+                            swap_s = f"; swap={nswap / nswap_attempt * 100:.1f}%"
+
+                        if progress:
+                            save_s = f" | saved at step {last_saved}" if last_saved is not None else ""
+                            print(
+                                f"\r  {100 * (i + 1) / nsteps:5.1f}% | "
+                                f"accept={acc:.1f}%{swap_s} | "
+                                f"GR={max_gr:.4f} (<{self.maxgr}) | "
+                                f"Tz={min_tz:.0f} (>{self.mintz}){save_s}   ",
+                                end="", flush=True)
+
+                        if max_gr < self.maxgr and min_tz > self.mintz:
+                            npass += 1
+                            if npass >= npass_required:
+                                converged = True
+                                final_step = i + 1
+                                break
+                        else:
+                            npass = 0
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
+
+        # trim
+        chain = chain[:final_step]
+        log_prob = log_prob[:final_step]
+
+        if progress:
+            if converged:
+                print(f"\n  Converged at step {final_step}/{nsteps}.")
+            else:
+                print(f"\n  Reached max steps ({nsteps}). NOT converged.")
+
+        self._chain = chain
+        self._log_prob = log_prob
+        self._pos_full = pos
+        self._logp_full = logp
+        return converged
+
+    def _run_continue(self, nsteps, nthin=1, scale=None, progress=True,
+                     check_every=None, npass_required=6, nworkers=1,
+                     save_every=0, save_file=None):
+        """
+        Continue sampling from an existing chain (e.g., after checkpoint load).
+
+        Parameters
+        ----------
+        nsteps : int
+            Additional stored steps per chain to append.
+        nthin, scale, progress, check_every, npass_required, nworkers,
+        save_every, save_file : see `run`.
+        """
+        if self._chain is None or self._log_prob is None:
+            raise RuntimeError("No existing chain to continue. Call run() or load() first.")
+        if self._pos_full is None or self._logp_full is None:
+            raise RuntimeError("Missing full temperature state; cannot resume reliably.")
+
+        ndim = self.ndim
+        nchains = self.nchains
+        ntemps = self.ntemps
+        betas = self.betas
+        rng = self.rng
+        logpost = self.logpost_func
+
+        if scale is None:
+            p0 = np.median(self._chain[-1], axis=0)
+            scale = np.abs(p0) * 0.01
+            scale[scale == 0] = 1e-5
+
+        if check_every is None:
+            check_every = max(100, nsteps // 20)
+
+        if save_every > 0 and save_file is None:
+            raise ValueError("save_file is required when save_every > 0")
+
+        use_pool = nworkers > 1
+
+        pos = self._pos_full
+        logp = self._logp_full
+
+        old_steps = self._chain.shape[0]
+        total_steps = old_steps + nsteps
+        chain = np.empty((total_steps, nchains, ndim))
+        log_prob = np.empty((total_steps, nchains))
+        chain[:old_steps] = self._chain
+        log_prob[:old_steps] = self._log_prob
+
+        naccept = 0
+        nattempt = 0
+        nswap = 0
+        nswap_attempt = 0
+        npass = 0
+        converged = False
+        final_step = total_steps
+        last_saved = None
+
+        if progress:
+            workers_s = f" ({nworkers} workers)" if use_pool else ""
+            print(f"Continuing MCMC{workers_s} for +{nsteps} steps ...")
+
+        pool = Pool(nworkers) if use_pool else None
+        try:
+            for k in range(nsteps):
+                for _thin in range(nthin):
+                    for m in range(ntemps):
+                        if m < ntemps - 1:
+                            for j in range(nchains):
+                                if rng.random() < 0.5:
+                                    nswap_attempt += 1
+                                    log_alpha = ((betas[m] - betas[m + 1])
+                                                 * (logp[j, m + 1] - logp[j, m]))
+                                    if np.log(rng.random()) < log_alpha:
+                                        nswap += 1
+                                        pos[j, m], pos[j, m + 1] = (
+                                            pos[j, m + 1].copy(), pos[j, m].copy())
+                                        logp[j, m], logp[j, m + 1] = (
+                                            logp[j, m + 1], logp[j, m])
+
+                        if self.stretch:
+                            proposals, log_facs = self._stretch_proposals_batch(
+                                m, pos)
+                        else:
+                            proposals, log_facs = self._de_proposals_batch(
+                                m, pos, scale)
+
+                        nattempt += nchains
+                        if pool is not None:
+                            new_lps = np.array(pool.map(logpost, list(proposals)))
+                        else:
+                            new_lps = np.array([logpost(proposals[j])
+                                                for j in range(nchains)])
+
+                        for j in range(nchains):
+                            if np.isfinite(new_lps[j]):
+                                log_alpha = (betas[m] * (new_lps[j] - logp[j, m])
+                                             + log_facs[j])
+                                if np.log(rng.random()) < log_alpha:
+                                    naccept += 1
+                                    pos[j, m] = proposals[j]
+                                    logp[j, m] = new_lps[j]
+
+                i = old_steps + k
+                chain[i] = pos[:, 0]
+                log_prob[i] = logp[:, 0]
+
+                if save_every > 0 and (i + 1) % save_every == 0:
+                    self._chain = chain[:i + 1]
+                    self._log_prob = log_prob[:i + 1]
+                    self._pos_full = pos
+                    self._logp_full = logp
+                    self.save(save_file)
+                    last_saved = i + 1
+                    if progress:
+                        pct = 100 * (i + 1) / total_steps
+                        acc = naccept / max(nattempt, 1) * 100
+                        swap_s = ""
+                        if ntemps > 1 and nswap_attempt > 0:
+                            swap_s = f"; swap={nswap / nswap_attempt * 100:.1f}%"
+                        print(f"\n  Checkpoint saved at step {i + 1}.")
+                        print(f"\r  {pct:5.1f}% | accept={acc:.1f}%{swap_s}   ",
+                              end="", flush=True)
+
+                if (i + 1) % check_every == 0 and i > 2 * nchains:
+                    chi2 = -2.0 * log_prob[:i + 1]
+                    burnndx = _find_burnin(chi2)
+                    post_burn = chain[burnndx:i + 1]
+
+                    if post_burn.shape[0] > 10:
+                        Rhat, Tz = _gelman_rubin(post_burn)
+                        max_gr = float(np.max(Rhat))
+                        min_tz = float(np.min(Tz))
+
+                        acc = naccept / max(nattempt, 1) * 100
+                        swap_s = ""
+                        if ntemps > 1 and nswap_attempt > 0:
+                            swap_s = f"; swap={nswap / nswap_attempt * 100:.1f}%"
+
+                        if progress:
+                            save_s = f" | saved at step {last_saved}" if last_saved is not None else ""
+                            print(
+                                f"\r  {100 * (i + 1) / total_steps:5.1f}% | "
+                                f"accept={acc:.1f}%{swap_s} | "
+                                f"GR={max_gr:.4f} (<{self.maxgr}) | "
+                                f"Tz={min_tz:.0f} (>{self.mintz}){save_s}   ",
+                                end="", flush=True)
+
+                        if max_gr < self.maxgr and min_tz > self.mintz:
+                            npass += 1
+                            if npass >= npass_required:
+                                converged = True
+                                final_step = i + 1
+                                break
+                        else:
+                            npass = 0
+                if converged:
                     break
-                    
-                old_tau = tau
-                
-                # Progress update
-                accept_rate = np.mean(sampler.acceptance_fraction) * 100
-                elapsed = time.time() - start_time
-                print(f"\nStep {sampler.iteration:6d}: accept = {accept_rate:.1f}%, "
-                      f"time = {elapsed:.1f}s")
-                print(f"   Autocorr times: {tau}")
-                print(f"   Chain length / max(tau): {sampler.iteration / np.max(tau):.1f}")
-                
-            except Exception as e:
-                # Autocorr time estimation can fail early in the run
-                if sampler.iteration < 100:
-                    continue
-                else:
-                    if debug:
-                        print(f"   Autocorr time estimation failed: {e}")
-        
-        if not converged:
-            print(f"\n⚠️  MCMC completed {maxsteps} steps without full convergence")
-            print("   Consider running longer or checking your model")
-            
-    else:
-        # Simple run without detailed monitoring
-        sampler.run_mcmc(pos, maxsteps, progress=True)
-    
-    runtime = time.time() - start_time
-    
-    if debug:
-        print(f"emcee MCMC completed in {runtime:.1f} seconds")
-        print(f"Final acceptance rate: {np.mean(sampler.acceptance_fraction)*100:.1f}%")
-    
-    # Convert emcee results to EXOZIPPy format
-    chain = sampler.get_chain()  # (nsteps, nwalkers, ndim)
-    chi2_chain = -2 * sampler.get_log_prob()  # Convert back to chi2
-    
-    # Reshape to EXOZIPPy format (add temperature dimension)
-    pars_exozippy = np.transpose(chain, (1, 2, 0))[np.newaxis, :, :, :]  # (1, nwalkers, ndim, nsteps)
-    chi2_exozippy = chi2_chain.T[np.newaxis, :, :]  # (1, nwalkers, nsteps)
-    lnprob_exozippy = sampler.get_log_prob().T[np.newaxis, :, :]
-    
-    # Calculate burn-in (use first 25% as burn-in)
-    burnndx = maxsteps // 4
-    
-    # Calculate convergence statistics using autocorrelation analysis
-    try:
-        # Get final autocorr time
-        final_tau = sampler.get_autocorr_time(quiet=True)
-        
-        # Calculate effective sample size (independent samples)
-        # After burn-in, we have (maxsteps - burnndx) samples
-        # But they're correlated with timescale tau
-        # So effective samples ≈ (maxsteps - burnndx) / (2 * tau)
-        eff_samples_per_param = (sampler.iteration - burnndx) / (2 * final_tau)
-        tz = int(np.min(eff_samples_per_param))  # Most conservative estimate
-        
-        # Convergence assessment:
-        # 1. Did we run long enough? (> 50 * tau)
-        # 2. Are autocorr times reasonable?
-        chain_length_adequate = np.all(sampler.iteration > 50 * final_tau)
-        tau_reasonable = np.all(final_tau < sampler.iteration / 10)  # tau shouldn't be > 10% of chain
-        
-        # Use a convergence metric based on autocorr time stability
-        if len(autocorr_times) > 1:
-            # Compare last few tau estimates
-            recent_tau = np.array(autocorr_times[-3:]) if len(autocorr_times) >= 3 else autocorr_times
-            tau_variation = np.std(recent_tau, axis=0) / np.mean(recent_tau, axis=0)
-            max_gr = np.max(tau_variation)  # Use tau stability as convergence metric
-        else:
-            max_gr = np.max(final_tau) / sampler.iteration  # Fraction of chain length
-            
-        # Overall convergence
-        if debug:
-            converged_overall = chain_length_adequate and tau_reasonable and (max_gr < 0.1)
-        else:
-            # If we ran without monitoring, use simpler criteria
-            converged_overall = chain_length_adequate and tau_reasonable
-        
-        if debug:
-            print(f"\n=== Convergence Analysis ===")
-            print(f"Final autocorr times: {final_tau}")
-            print(f"Chain length / tau: {sampler.iteration / final_tau}")
-            print(f"Chain length adequate (>50τ): {chain_length_adequate}")
-            print(f"Tau reasonable (<10% chain): {tau_reasonable}")
-            print(f"Effective samples per param: {eff_samples_per_param}")
-            print(f"Convergence metric: {max_gr:.4f}")
-            
-    except Exception as e:
-        if debug:
-            print(f"Autocorr analysis failed: {e}")
-        # Fallback to simple estimates
-        final_tau = np.ones(ndim) * 10  # Conservative estimate
-        max_gr = 1.0
-        tz = (sampler.iteration - burnndx) // 10  # Conservative
-        converged_overall = sampler.iteration > 1000  # Simple criterion
-    
-    results = {
-        'pars': pars_exozippy,
-        'chi2': chi2_exozippy, 
-        'lnprob': lnprob_exozippy,
-        'tofit': tofit,
-        'temps': np.array([1.0]),  # Only one temperature for emcee
-        'betas': np.array([1.0]),
-        'nsteps': maxsteps,
-        'burnndx': burnndx,
-        'converged': converged_overall,
-        'tz': tz,
-        'max_gr': max_gr,
-        'naccept': sampler.acceptance_fraction.sum().reshape(1, -1),  # Reshape for compatibility
-        'runtime': runtime,
-        'backend': 'emcee'
-    }
-    
-    return results
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
 
+        chain = chain[:final_step]
+        log_prob = log_prob[:final_step]
 
-# Example usage and testing
-if __name__ == "__main__":
-    
-    # Simple test case - 1D Gaussian
-    def chi2_gaussian(pars):
-        x = pars['x']
-        return (x - 3.0) ** 2  # Target at x = 3
-        
-    bestpars = {'x': 2.5}
-    scale = {'x': 0.1}
-    
-    results = exozippy_demcpt(
-        chi2_gaussian,
-        bestpars,
-        scale=scale,
-        nchains=4,
-        ntemps=4,
-        maxsteps=5000,
-        debug=True,
-        seed=42
-    )
-    
-    # Analyze results
-    cold_chains = results['pars'][0, :, 0, results['burnndx']:]  # Cold temp, all chains, param 0, post burn-in
-    samples = cold_chains.flatten()
-    
-    print(f"\nResults:")
-    print(f"True value: 3.0")
-    print(f"Recovered mean: {np.mean(samples):.3f}")
-    print(f"Recovered std: {np.std(samples):.3f}")
-    print(f"Converged: {results['converged']}")
+        if progress:
+            if converged:
+                print(f"\n  Converged at step {final_step}/{total_steps}.")
+            else:
+                print(f"\n  Reached max steps ({total_steps}). NOT converged.")
+
+        self._chain = chain
+        self._log_prob = log_prob
+        self._pos_full = pos
+        self._logp_full = logp
+        return converged
+
+    # ----- properties --------------------------------------------------------
+
+    @property
+    def chain(self):
+        """Raw chain array (nsteps, nchains, ndim)."""
+        return self._chain
+
+    @property
+    def log_prob(self):
+        """Log-posterior array (nsteps, nchains)."""
+        return self._log_prob
+
+    @property
+    def flatchain(self):
+        """Flat chain with burn-in removed and bad chains discarded."""
+        if self._chain is None:
+            return None
+        chi2 = -2.0 * self._log_prob
+        burnndx = _find_burnin(chi2)
+        good = _identify_good_chains(chi2[burnndx:])
+        return self._chain[burnndx:, good].reshape(-1, self.ndim)
+
+    @property
+    def flatlog_prob(self):
+        """Flat log-posterior with burn-in removed and bad chains discarded."""
+        if self._log_prob is None:
+            return None
+        chi2 = -2.0 * self._log_prob
+        burnndx = _find_burnin(chi2)
+        good = _identify_good_chains(chi2[burnndx:])
+        return self._log_prob[burnndx:, good].ravel()
+
+    # ----- diagnostics -------------------------------------------------------
+
+    def summary(self, param_names=None):
+        """
+        Print convergence summary.
+
+        Parameters
+        ----------
+        param_names : list of str, optional
+            Names for each parameter dimension.
+
+        Returns
+        -------
+        dict with 'Rhat', 'Tz', 'burnin', 'good_chains', 'n_bad'
+        """
+        if self._chain is None:
+            print("No chain. Call run() first.")
+            return None
+
+        chi2 = -2.0 * self._log_prob
+        burnndx = _find_burnin(chi2)
+        good = _identify_good_chains(chi2[burnndx:])
+        n_bad = self.nchains - len(good)
+
+        post_burn = self._chain[burnndx:, good]
+        Rhat, Tz = _gelman_rubin(post_burn)
+
+        nsteps = self._chain.shape[0]
+        print(f"Steps: {nsteps}  Burn-in: {burnndx}  "
+              f"Good chains: {len(good)}/{self.nchains}")
+        if n_bad:
+            print(f"  WARNING: {n_bad} bad chain(s) discarded")
+        print()
+        print(f"{'#':>4s}  {'Parameter':<16s} {'Rhat':>8s} {'Tz':>10s}  Status")
+        print("-" * 52)
+        for d in range(self.ndim):
+            name = param_names[d] if param_names and d < len(param_names) else str(d)
+            ok = Rhat[d] < self.maxgr and Tz[d] > self.mintz
+            mark = "OK" if ok else "**BAD**"
+            print(f"{d:4d}  {name:<16s} {Rhat[d]:8.4f} {Tz[d]:10.1f}  {mark}")
+
+        return {
+            "Rhat": Rhat,
+            "Tz": Tz,
+            "burnin": burnndx,
+            "good_chains": good,
+            "n_bad": n_bad,
+        }
+
+    # ----- HDF5 I/O ----------------------------------------------------------
+
+    def save(self, filename):
+        """
+        Save sampler state to HDF5 file.
+
+        Parameters
+        ----------
+        filename : str
+            Output HDF5 file path.
+        """
+        if self._chain is None:
+            raise RuntimeError("No chain data. Call run() first.")
+
+        with h5py.File(filename, "w") as f:
+            f.create_dataset("chain", data=self._chain, compression="gzip",
+                             compression_opts=4)
+            f.create_dataset("log_prob", data=self._log_prob, compression="gzip",
+                             compression_opts=4)
+            if self._pos_full is not None:
+                f.create_dataset("pos", data=self._pos_full, compression="gzip",
+                                 compression_opts=4)
+            if self._logp_full is not None:
+                f.create_dataset("logp_full", data=self._logp_full, compression="gzip",
+                                 compression_opts=4)
+
+            cfg = f.create_group("config")
+            cfg.attrs["ndim"] = self.ndim
+            cfg.attrs["nchains"] = self.nchains
+            cfg.attrs["ntemps"] = self.ntemps
+            cfg.attrs["maxgr"] = self.maxgr
+            cfg.attrs["mintz"] = self.mintz
+            cfg.attrs["stretch"] = self.stretch
+            cfg.create_dataset("betas", data=self.betas)
+
+    @classmethod
+    def load(cls, filename, log_posterior):
+        """
+        Load sampler state from HDF5 file.
+
+        Parameters
+        ----------
+        filename : str
+            Input HDF5 file path.
+        log_posterior : callable
+            The log-posterior function (not stored in HDF5).
+
+        Returns
+        -------
+        sampler : DEMCPTSampler
+            Sampler with chain and log_prob restored.
+        """
+        with h5py.File(filename, "r") as f:
+            chain = f["chain"][:]
+            log_prob_data = f["log_prob"][:]
+            pos_full = f["pos"][:] if "pos" in f else None
+            logp_full = f["logp_full"][:] if "logp_full" in f else None
+
+            cfg = f["config"]
+            ndim = int(cfg.attrs["ndim"])
+            nchains = int(cfg.attrs["nchains"])
+            ntemps = int(cfg.attrs["ntemps"])
+            maxgr = float(cfg.attrs["maxgr"])
+            mintz = float(cfg.attrs["mintz"])
+            stretch = bool(cfg.attrs["stretch"])
+            betas = cfg["betas"][:]
+
+        sampler = cls(log_posterior, ndim=ndim, nchains=nchains,
+                      ntemps=ntemps, stretch=stretch,
+                      maxgr=maxgr, mintz=mintz)
+        sampler.betas = betas
+        sampler._chain = chain
+        sampler._log_prob = log_prob_data
+        sampler._pos_full = pos_full
+        sampler._logp_full = logp_full
+        return sampler

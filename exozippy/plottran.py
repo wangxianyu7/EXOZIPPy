@@ -16,9 +16,8 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 from exozippy.exozippy_tran import exozippy_tran
-from exozippy.fit_exoplanet import (
-    read_transit_data, tc_to_tp, _derive_ar,
-)
+from exozippy.fit_exoplanet import read_transit_data
+from exozippy.exozippy_chi2 import tc_to_tp, derive_ar as _derive_ar
 
 
 # ---------- shared helpers ----------
@@ -107,13 +106,13 @@ def _draw_phased(ax_data, ax_oc, data, bestfit, e, omega, mstar,
     )
 
     # Posterior draws
-    if samples is not None:
-        posterior = _posterior_transit_models(
-            t_fine, samples, mstar, e, omega
-        )
-        for m in posterior:
-            ax_data.plot(dt_fine_hrs, m, color='lightskyblue',
-                         alpha=0.1, lw=0.5, zorder=1)
+    # if samples is not None:
+    #     posterior = _posterior_transit_models(
+    #         t_fine, samples, mstar, e, omega
+    #     )
+    #     for m in posterior:
+    #         ax_data.plot(dt_fine_hrs, m, color='lightskyblue',
+    #                      alpha=0.1, lw=0.5, zorder=1)
 
     ax_data.plot(dt_hrs, flux, 'k.', ms=3, zorder=2)
     ax_data.plot(dt_fine_hrs, model_fine, '-', color='red', lw=2, zorder=3)

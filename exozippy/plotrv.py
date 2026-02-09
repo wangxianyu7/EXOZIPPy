@@ -16,7 +16,8 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 from exozippy.exozippy_rv import exozippy_rv
-from exozippy.fit_exoplanet import read_rv_data, tc_to_tp
+from exozippy.fit_exoplanet import read_rv_data
+from exozippy.exozippy_chi2 import tc_to_tp
 
 
 # ---------- shared helpers ----------
