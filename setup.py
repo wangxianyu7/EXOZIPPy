@@ -153,6 +153,8 @@ setup(
         'emcee',
         'ptemcee',
         'requests',
+        'MulensModel',
+        'ipdb',
     ],
 
     package_data={
