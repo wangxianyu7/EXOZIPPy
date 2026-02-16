@@ -224,14 +224,14 @@ def _load_filter_curve(idl_path: str):
 @functools.lru_cache(maxsize=4)
 def _load_filter_names(root_dir: str):
     """Load and cache filter name mappings."""
-    filter_file = filepath('filternames2.txt', root_dir, ['EXOZIPPy','exozippy','sed', 'mist'])
+    filter_file = filepath('filternames2.txt', root_dir, ['sed', 'mist'])
     return np.loadtxt(filter_file, dtype=str, comments="#", unpack=True)
 
 @functools.lru_cache(maxsize=32)
 def _load_bcarrays(bands_tuple, root_dir: str):
     """Load and cache stacked BC arrays for a given band set."""
     kname, mname, cname, svoname = _load_filter_names(root_dir)
-    root = pathlib.Path(root_dir) / 'EXOZIPPy' / 'exozippy' / 'sed' / 'mist'
+    root = pathlib.Path(root_dir) / 'sed' / 'mist'
     bc_cubes, filterprops = [], []
     for band in bands_tuple:
         candidates = [band]
@@ -304,7 +304,7 @@ def mistmultised(teff, logg, feh, av, distance, lstar, errscale, sedfile,
     nbands     = len(sedbands)
 
     # ---------- 3. Load / cache the MIST grid & BC cubes ------------------
-    root = pathlib.Path(exozippy.MODULE_PATH) / 'EXOZIPPy' / 'exozippy' / 'sed' / 'mist'
+    root = pathlib.Path(exozippy.MODULE_PATH) / 'sed' / 'mist'
     gridfile = root / 'mist.sed.grid.idl'
     teffgrid, logggrid, fehgrid, avgrid = _load_mist_grid(str(gridfile))
 
@@ -529,7 +529,7 @@ def read_sed_file(
         errmag[i] = float(entries[2])
 
         # Attempt to load filter curve
-        idlfile = filepath(sedbands[i] + '.idl', root_dir, ['EXOZIPPy','exozippy','sed', 'filtercurves'])
+        idlfile = filepath(sedbands[i] + '.idl', root_dir, ['sed', 'filtercurves'])
 
         if not os.path.isfile(idlfile):
             match = np.where(keivanname == sedbands[i])[0]
@@ -537,14 +537,14 @@ def read_sed_file(
                 if svoname[match[0]] == 'Unsupported':
                     printandlog(f'{sedbands[i]} is unsupported; try using the SVO name', logname)
                     continue
-                idlfile = filepath(svoname[match[0]] + '.idl', root_dir,  ['EXOZIPPy','exozippy','sed', 'filtercurves'])
+                idlfile = filepath(svoname[match[0]] + '.idl', root_dir,  ['sed', 'filtercurves'])
             else:
                 match = np.where(mistname == sedbands[i])[0]
                 if match.size == 1:
                     if svoname[match[0]] == 'Unsupported':
                         printandlog(f'{sedbands[i]} is unsupported; try using the SVO name', logname)
                         continue
-                    idlfile = filepath(svoname[match[0]] + '.idl', root_dir,  ['EXOZIPPy','exozippy','sed', 'filtercurves'])
+                    idlfile = filepath(svoname[match[0]] + '.idl', root_dir,  ['sed', 'filtercurves'])
 
         if not os.path.isfile(idlfile) and download_new:
             getfilter(sedbands[i])  # needs implementation

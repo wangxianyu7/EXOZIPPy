@@ -142,7 +142,7 @@ def _interp_atmosphere(teff, logg, feh):
 def _apply_extinction(lamflam, av):
     """Apply extinction to model atmosphere."""
     # Load extinction law
-    ext_file = pathlib.Path(exozippy.MODULE_PATH) / 'EXOZIPPy' / 'exozippy' / 'sed' / 'extinction_law.ascii'
+    ext_file = pathlib.Path(exozippy.MODULE_PATH) / 'sed' / 'extinction_law.ascii'
     if ext_file.exists():
         klam, kkap = np.loadtxt(ext_file, unpack=True)
         kapv = np.interp(0.55, klam, kkap)
@@ -210,7 +210,7 @@ def _compute_sed_model(teff, logg, feh, av, distance, lstar, rstar, sedfile):
     filter_curve_sum = np.asarray(sed_data['filter_curve_sum'], dtype=float)
 
     # Load MIST BC grid for synthetic magnitudes (matches fit_exoplanet)
-    root = pathlib.Path(exozippy.MODULE_PATH) / 'EXOZIPPy' / 'exozippy' / 'sed' / 'mist'
+    root = pathlib.Path(exozippy.MODULE_PATH) / 'sed' / 'mist'
     gridfile = root / 'mist.sed.grid.idl'
     teffgrid, logggrid, fehgrid, avgrid = _load_mist_grid(str(gridfile))
 
