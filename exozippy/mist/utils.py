@@ -81,7 +81,7 @@ def readeep(mstar, feh, vvcrit=0.0, alpha=0.0, rstar=None, teff=None, age=None, 
 
     mstarstr = f"{int(round(mstar * 100)):05d}"
 
-    base_dir = os.getenv("EXOFAST_PATH")
+    base_dir = os.getenv("EXOFAST_PATH", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     if v1_2:
         subdir = os.path.join("mist", f"MIST_v1.2_tracks", f"feh_{fehstr}_afe_{alphastr}_vvcrit{vvcritstr}")
     else:
