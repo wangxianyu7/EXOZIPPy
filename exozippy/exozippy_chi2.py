@@ -53,6 +53,7 @@ _LCOSW_SCALE = 0.1                     # lcosw
 _SIGN_SCALE = 0.1                      # sign (root selector)
 _JITTERVAR_SCALE = 1.0                 # per telescope, m^2/s^2
 _VARIANCE_SCALE = 1e-8                 # per transit, flux^2
+_DILUTE_SCALE = 0.01                   # per transit, dilution fraction
 _TTV_SCALE = 0.02                      # per transit, days (~30 min)
 
 # Legacy single-instrument constants (for backward compat imports)
@@ -76,7 +77,7 @@ def param_names(use_mist: bool, nstars: int = 1, has_sed: bool = True,
                 ntran: int = 1, ntel: int = 1, nbands: int = 1,
                 circular: bool = True, usevcve: bool = False,
                 fitjittervar: bool = False, fitvariance: bool = False,
-                fitttv: bool = False,
+                fitdilute: bool = False, fitttv: bool = False,
                 fitthermal: bool = False, fitreflect: bool = False,
                 fitbeam: bool = False, fitellip: bool = False):
     """Return the ordered parameter name list.
@@ -121,6 +122,10 @@ def param_names(use_mist: bool, nstars: int = 1, has_sed: bool = True,
     if fitvariance:
         for j in range(ntran):
             names.append(f'variance_{j}')
+    # Per-transit dilution
+    if fitdilute:
+        for j in range(ntran):
+            names.append(f'dilute_{j}')
     # Per-transit TTV
     if fitttv:
         for j in range(ntran):
@@ -145,7 +150,7 @@ def param_scales(use_mist: bool, nstars: int = 1, has_sed: bool = True,
                  circular: bool = True, usevcve: bool = False,
                  ar_init: float = None,
                  fitjittervar: bool = False, fitvariance: bool = False,
-                 fitttv: bool = False,
+                 fitdilute: bool = False, fitttv: bool = False,
                  fitthermal: bool = False, fitreflect: bool = False,
                  fitbeam: bool = False, fitellip: bool = False):
     """Return scales matching param_names ordering.
@@ -180,6 +185,8 @@ def param_scales(use_mist: bool, nstars: int = 1, has_sed: bool = True,
     scales.append(np.full(ntran, _F0_SCALE))
     if fitvariance:
         scales.append(np.full(ntran, _VARIANCE_SCALE))
+    if fitdilute:
+        scales.append(np.full(ntran, _DILUTE_SCALE))
     if fitttv:
         scales.append(np.full(ntran, _TTV_SCALE))
     scales.append(np.full(ntel, _GAMMA_SCALE))
@@ -200,7 +207,7 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
                   ntran=1, ntel=1, nbands=1,
                   circular=True, usevcve=False,
                   fitjittervar=False, fitvariance=False,
-                  fitttv=False, epoch_list=None,
+                  fitdilute=False, fitttv=False, epoch_list=None,
                   fitthermal=False, fitreflect=False,
                   fitbeam=False, fitellip=False):
     """
@@ -303,6 +310,12 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
         for j in range(ntran):
             variance_list.append(params[idx]); idx += 1
 
+    # Per-transit dilution
+    dilute_list = []
+    if fitdilute:
+        for j in range(ntran):
+            dilute_list.append(params[idx]); idx += 1
+
     # Per-transit TTV
     ttv_list = []
     if fitttv:
@@ -351,10 +364,10 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
         thermal=thermal_list, reflect=reflect_list,
         beam=beam_val, ellipsoidal=ellip_val,
         f0=f0_list, gamma=gamma_list,
-        variance=variance_list, jittervar=jittervar_list,
+        variance=variance_list, dilute=dilute_list, jittervar=jittervar_list,
         ttv=ttv_list, fitttv=fitttv, epoch_list=epoch_list,
         nstars=nstars, ntran=ntran, ntel=ntel, nbands=nbands,
-        fitjittervar=fitjittervar, fitvariance=fitvariance,
+        fitjittervar=fitjittervar, fitvariance=fitvariance, fitdilute=fitdilute,
         fitthermal=fitthermal, fitreflect=fitreflect,
         fitbeam=fitbeam, fitellip=fitellip,
     )
@@ -402,6 +415,12 @@ def check_bounds(d):
     for f0 in d['f0']:
         if f0 <= 0:
             return INF_CHI2
+
+    # Per-transit dilution bounds: (-1, 1)
+    if d.get('fitdilute') and d.get('dilute'):
+        for dilute_j in d['dilute']:
+            if dilute_j <= -1.0 or dilute_j >= 1.0:
+                return INF_CHI2
 
     # TTV bounds: |ttv_j| < period/2
     if d.get('fitttv') and d.get('ttv'):
@@ -533,6 +552,8 @@ def chi2_transit(d, tran_data_list, e, omega, tran_addvar_list):
     fitreflect = d.get('fitreflect', False)
     fitbeam = d.get('fitbeam', False)
     fitellip = d.get('fitellip', False)
+    fitdilute = d.get('fitdilute', False)
+    dilute_list = d.get('dilute', [])
     fitttv = d.get('fitttv', False)
     ttv_list = d.get('ttv', [])
     epoch_list = d.get('epoch_list') or []
@@ -551,6 +572,7 @@ def chi2_transit(d, tran_data_list, e, omega, tran_addvar_list):
         reflect_j = d['reflect'][bandndx] if fitreflect and d['reflect'] else 0.0
         beam_j = d['beam'] if fitbeam else 0.0
         ellip_j = d['ellipsoidal'] if fitellip else 0.0
+        dilute_j = dilute_list[j] if fitdilute and dilute_list else 0.0
         # Per-transit tp: apply TTV offset if active
         if fitttv and ttv_list and j < len(ttv_list) and j < len(epoch_list):
             tc_j = d['tc'] + epoch_list[j] * d['period'] + ttv_list[j]
@@ -563,7 +585,7 @@ def chi2_transit(d, tran_data_list, e, omega, tran_addvar_list):
                 e, omega, d['p'], u1_j, u2_j, f0_j,
                 thermal=thermal_j, reflect=reflect_j,
                 beam=beam_j, ellipsoidal=ellip_j,
-                tc=d['tc'],
+                dilute=dilute_j, tc=d['tc'],
             )
         except Exception:
             return INF_CHI2
@@ -705,7 +727,7 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
                ntran=1, ntel=1, nbands=1,
                circular=True, usevcve=False,
                fitjittervar=False, fitvariance=False,
-               fitttv=False, epoch_list=None,
+               fitdilute=False, fitttv=False, epoch_list=None,
                fitthermal=False, fitreflect=False,
                fitbeam=False, fitellip=False):
     """
@@ -740,7 +762,7 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
                       ntran=ntran, ntel=ntel, nbands=nbands,
                       circular=circular, usevcve=usevcve,
                       fitjittervar=fitjittervar, fitvariance=fitvariance,
-                      fitttv=fitttv, epoch_list=epoch_list,
+                      fitdilute=fitdilute, fitttv=fitttv, epoch_list=epoch_list,
                       fitthermal=fitthermal, fitreflect=fitreflect,
                       fitbeam=fitbeam, fitellip=fitellip)
     if d is None:

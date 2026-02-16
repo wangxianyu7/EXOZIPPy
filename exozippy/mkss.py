@@ -385,6 +385,9 @@ def _make_transit(tranfile, idx, priors, tc=None, period=None, fitttv=False):
         variance=_mkpar(f'variance{suffix}', priors, initval=0.0,
                          lower=0.0,
                          latex=r'\sigma_j^2', description='Added variance'),
+        dilute=_mkpar(f'dilute{suffix}', priors, initval=0.0,
+                       lower=-1.0, upper=1.0, scale=0.01,
+                       latex=r'A_D', description='Dilution', unit=''),
         ttv=_mkpar(f'ttv{suffix}', priors, initval=0.0,
                     scale=0.02,
                     latex=r'TTV', description='Transit timing variation',
@@ -453,6 +456,7 @@ def mkss(
     use_mist=False,
     fitjittervar=False,
     fitvariance=False,
+    fitdilute=False,
     fitthermal=False,
     fitreflect=False,
     fitbeam=False,
@@ -568,6 +572,10 @@ def mkss(
     if fitvariance:
         for j in range(len(transits)):
             param_names.append(f'variance_{j}')
+    # Per-transit dilution
+    if fitdilute:
+        for j in range(len(transits)):
+            param_names.append(f'dilute_{j}')
     # Per-transit TTV
     if _fitttv:
         for j in range(len(transits)):

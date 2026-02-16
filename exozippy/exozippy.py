@@ -92,6 +92,7 @@ def exozippy(
     nstars=1,
     fitjittervar=False,
     fitvariance=False,
+    fitdilute=False,
     fitthermal=False,
     fitreflect=False,
     fitbeam=False,
@@ -152,7 +153,7 @@ def exozippy(
         _log('Using Vc/Ve eccentricity parameterization (transit-only)', verbose)
 
     pc_kwargs = dict(fitjittervar=fitjittervar, fitvariance=fitvariance,
-                     fitttv=fitttv,
+                     fitdilute=fitdilute, fitttv=fitttv,
                      fitthermal=fitthermal, fitreflect=fitreflect,
                      fitbeam=fitbeam, fitellip=fitellip,
                      usevcve=usevcve)
@@ -274,6 +275,7 @@ def _cli():
     parser.add_argument('--checkpoint', type=str, default=None, help='HDF5 checkpoint path (default: <prefix>mcmc.h5)')
     parser.add_argument('--checkpoint-every', type=int, default=100, help='Checkpoint interval in steps (default: 100)')
     parser.add_argument('--ttv', action='store_true', help='Fit transit timing variations (requires >=3 transits)')
+    parser.add_argument('--dilute', action='store_true', help='Fit per-transit dilution from contaminating flux')
     parser.add_argument('--novcve', action='store_true', help='Disable Vc/Ve eccentricity parameterization')
     parser.add_argument('--quiet', action='store_true', help='Reduce console output')
     args = parser.parse_args()
@@ -286,6 +288,7 @@ def _cli():
         prefix=args.prefix,
         circular=not args.noncircular,
         nomist=args.nomist,
+        fitdilute=args.dilute,
         fitttv=args.ttv,
         novcve=args.novcve,
         skipopt=args.skipopt,

@@ -39,7 +39,7 @@ def _mcmc_log_posterior(theta, tran_data_list, rv_data_list, sedfile, priors,
                         ntran=1, ntel=1, nbands=1,
                         circular=True, usevcve=False,
                         fitjittervar=False, fitvariance=False,
-                        fitttv=False, epoch_list=None,
+                        fitdilute=False, fitttv=False, epoch_list=None,
                         fitthermal=False, fitreflect=False,
                         fitbeam=False, fitellip=False):
     """Module-level log-posterior for picklability with multiprocessing."""
@@ -53,7 +53,7 @@ def _mcmc_log_posterior(theta, tran_data_list, rv_data_list, sedfile, priors,
                       ntran=ntran, ntel=ntel, nbands=nbands,
                       circular=circular, usevcve=usevcve,
                       fitjittervar=fitjittervar, fitvariance=fitvariance,
-                      fitttv=fitttv, epoch_list=epoch_list,
+                      fitdilute=fitdilute, fitttv=fitttv, epoch_list=epoch_list,
                       fitthermal=fitthermal, fitreflect=fitreflect,
                       fitbeam=fitbeam, fitellip=fitellip)
     if not np.isfinite(chi2) or chi2 > 1e9:
@@ -130,7 +130,7 @@ def build_initial_guess(priorfile, tranfile, rvfile, e=0.0,
                         omega=np.pi/2, circular=True, usevcve=False,
                         use_mist=False, nstars=1,
                         fitjittervar=False, fitvariance=False,
-                        fitttv=False,
+                        fitdilute=False, fitttv=False,
                         fitthermal=False, fitreflect=False,
                         fitbeam=False, fitellip=False):
     """
@@ -145,7 +145,7 @@ def build_initial_guess(priorfile, tranfile, rvfile, e=0.0,
         circular=circular,
         usevcve=usevcve,
         fitjittervar=fitjittervar, fitvariance=fitvariance,
-        fitttv=fitttv,
+        fitdilute=fitdilute, fitttv=fitttv,
         fitthermal=fitthermal, fitreflect=fitreflect,
         fitbeam=fitbeam, fitellip=fitellip,
     )
@@ -192,7 +192,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
                   omega=np.pi/2, circular=True, usevcve=False,
                   verbose=True, use_mist=False, nstars=1,
                   fitjittervar=False, fitvariance=False,
-                  fitttv=False,
+                  fitdilute=False, fitttv=False,
                   fitthermal=False, fitreflect=False,
                   fitbeam=False, fitellip=False):
     """
@@ -245,7 +245,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
                           ntran=ntran, ntel=ntel, nbands=nbands,
                           circular=circular, usevcve=usevcve,
                           fitjittervar=fitjittervar, fitvariance=fitvariance,
-                          fitttv=_fitttv,
+                          fitdilute=fitdilute, fitttv=_fitttv,
                           fitthermal=fitthermal, fitreflect=fitreflect,
                           fitbeam=fitbeam, fitellip=fitellip)
 
@@ -265,7 +265,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
         nstars=nstars,
         circular=circular,
         usevcve=usevcve,
-        fitttv=_fitttv,
+        fitdilute=fitdilute, fitttv=_fitttv,
         fitthermal=fitthermal, fitreflect=fitreflect,
         fitbeam=fitbeam, fitellip=fitellip,
     )
@@ -313,7 +313,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
             ntran=ntran, ntel=ntel, nbands=nbands,
             circular=circular, usevcve=usevcve,
             fitjittervar=fitjittervar, fitvariance=fitvariance,
-            fitttv=_fitttv, epoch_list=epoch_list,
+            fitdilute=fitdilute, fitttv=_fitttv, epoch_list=epoch_list,
             fitthermal=fitthermal, fitreflect=fitreflect,
             fitbeam=fitbeam, fitellip=fitellip)
         _log(f"Initial chi2     : {chi2_init:.2f}", verbose)
@@ -329,7 +329,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
                               ntran=ntran, ntel=ntel, nbands=nbands,
                               circular=circular, usevcve=usevcve, ar_init=ar_init,
                               fitjittervar=fitjittervar, fitvariance=fitvariance,
-                              fitttv=_fitttv,
+                              fitdilute=fitdilute, fitttv=_fitttv,
                               fitthermal=fitthermal, fitreflect=fitreflect,
                               fitbeam=fitbeam, fitellip=fitellip)
 
@@ -344,7 +344,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
             ntran=ntran, ntel=ntel, nbands=nbands,
             circular=circular, usevcve=usevcve,
             fitjittervar=fitjittervar, fitvariance=fitvariance,
-            fitttv=_fitttv, epoch_list=epoch_list,
+            fitdilute=fitdilute, fitttv=_fitttv, epoch_list=epoch_list,
             fitthermal=fitthermal, fitreflect=fitreflect,
             fitbeam=fitbeam, fitellip=fitellip)
 
@@ -425,6 +425,10 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
         for j in range(ntran):
             max_flux_err = max(td['err'].max() for td in tran_data_list) if tran_data_list else 0.01
             bounds.append((-max_flux_err**2, 10 * max_flux_err**2))
+    # Per-transit dilution bounds
+    if fitdilute:
+        for j in range(ntran):
+            bounds.append((-1.0, 1.0))
     # Per-transit TTV bounds: |ttv| < period/2
     if _fitttv:
         half_period = period0 / 2.0
@@ -549,7 +553,7 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
              ntemps=1, verbose=True, use_mist=False, nthreads=None,
              checkpoint=None, checkpoint_every=0, resume=True, nstars=1,
              fitjittervar=False, fitvariance=False,
-             fitttv=False,
+             fitdilute=False, fitttv=False,
              fitthermal=False, fitreflect=False,
              fitbeam=False, fitellip=False):
     """Run DEMC-PT MCMC sampling around the best-fit joint solution."""
@@ -591,12 +595,12 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
                                 usevcve=usevcve, verbose=verbose,
                                 use_mist=use_mist, nstars=nstars,
                                 fitjittervar=fitjittervar, fitvariance=fitvariance,
-                                fitttv=_fitttv,
+                                fitdilute=fitdilute, fitttv=_fitttv,
                                 fitthermal=fitthermal, fitreflect=fitreflect,
                                 fitbeam=fitbeam, fitellip=fitellip)
 
     pc_kwargs = dict(fitjittervar=fitjittervar, fitvariance=fitvariance,
-                     fitttv=_fitttv,
+                     fitdilute=fitdilute, fitttv=_fitttv,
                      fitthermal=fitthermal, fitreflect=fitreflect,
                      fitbeam=fitbeam, fitellip=fitellip,
                      usevcve=usevcve)

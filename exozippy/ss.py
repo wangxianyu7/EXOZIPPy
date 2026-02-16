@@ -109,6 +109,7 @@ class Transit:
     """Per-transit parameters (mirrors IDL ss.transit[i])."""
     f0: Parameter = None            # normalization
     variance: Parameter = None      # added variance (jitter)
+    dilute: Parameter = None        # dilution from contaminating flux
     ttv: Parameter = None           # transit timing variation (days)
     # Data arrays
     bjd: Optional[np.ndarray] = None
@@ -157,7 +158,7 @@ _PLANET_PARAMS = frozenset([
     'beam', 'ellipsoidal',
 ])
 _BAND_PARAMS = frozenset(['u1', 'u2', 'thermal', 'reflect'])
-_TRANSIT_PARAMS = frozenset(['f0', 'variance', 'tran_addvar', 'ttv'])
+_TRANSIT_PARAMS = frozenset(['f0', 'variance', 'dilute', 'tran_addvar', 'ttv'])
 _TELESCOPE_PARAMS = frozenset(['gamma', 'jittervar', 'jitter', 'rv_jittervar'])
 
 # Aliases for backward compatibility with the old bestfit dict
