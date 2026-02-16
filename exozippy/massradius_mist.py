@@ -475,71 +475,75 @@ def plot_mist_track(bestfit, outfile, vvcrit=None, alpha=None, range_vals=None):
 
     nstars = bestfit.nstars if isinstance(bestfit, SS) else 1
 
-    if nstars == 1:
-        _plot_single_star_track(bestfit, '', outfile, vvcrit, alpha, range_vals)
-    else:
-        # Multi-star: overlay all tracks on a single plot
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
+    try:
+        if nstars == 1:
+            _plot_single_star_track(bestfit, '', outfile, vvcrit, alpha, range_vals)
+        else:
+            # Multi-star: overlay all tracks on a single plot
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
 
-        fig, ax = plt.subplots(figsize=(8, 6))
-        gravitysun = 27420.011
-        colors = ['blue', 'red', 'green', 'purple', 'orange']
+            fig, ax = plt.subplots(figsize=(8, 6))
+            gravitysun = 27420.011
+            colors = ['blue', 'red', 'green', 'purple', 'orange']
 
-        for i in range(nstars):
-            suffix = f'_{i}'
-            mstar = bestfit[f'mstar{suffix}']
-            feh = bestfit[f'feh{suffix}']
-            age = bestfit[f'age{suffix}']
-            teff = bestfit[f'teff{suffix}']
-            rstar = bestfit[f'rstar{suffix}']
-            label = f'Star {chr(65+i)}'
+            for i in range(nstars):
+                suffix = f'_{i}'
+                mstar = bestfit[f'mstar{suffix}']
+                feh = bestfit[f'feh{suffix}']
+                age = bestfit[f'age{suffix}']
+                teff = bestfit[f'teff{suffix}']
+                rstar = bestfit[f'rstar{suffix}']
+                label = f'Star {chr(65+i)}'
 
-            if not (ALLOWED_MASS.min() <= mstar <= ALLOWED_MASS.max()):
-                continue
-            if not (ALLOWED_INITFEH.min() <= feh <= ALLOWED_INITFEH.max()):
-                continue
+                if not (ALLOWED_MASS.min() <= mstar <= ALLOWED_MASS.max()):
+                    continue
+                if not (ALLOWED_INITFEH.min() <= feh <= ALLOWED_INITFEH.max()):
+                    continue
 
-            try:
-                teffs_iso, rstars_iso, ages_iso, eeps_iso = _interpolate_track_for_plot(
-                    mstar, feh, vvcrit=vvcrit, alpha=alpha
-                )
-            except (ValueError, IndexError):
-                continue
+                try:
+                    teffs_iso, rstars_iso, ages_iso, eeps_iso = _interpolate_track_for_plot(
+                        mstar, feh, vvcrit=vvcrit, alpha=alpha
+                    )
+                except (ValueError, IndexError):
+                    continue
 
-            if len(teffs_iso) == 0:
-                continue
+                if len(teffs_iso) == 0:
+                    continue
 
-            loggs_iso = np.log10(gravitysun * mstar / rstars_iso**2)
+                loggs_iso = np.log10(gravitysun * mstar / rstars_iso**2)
 
-            # Track line
-            color = colors[i % len(colors)]
-            ax.plot(teffs_iso, loggs_iso, '-', color=color, lw=1, label=f'{label} track')
+                # Track line
+                color = colors[i % len(colors)]
+                ax.plot(teffs_iso, loggs_iso, '-', color=color, lw=1, label=f'{label} track')
 
-            # Best-fit point
-            logg_fit = np.log10(gravitysun * mstar / rstar**2)
-            ax.plot(teff, logg_fit, 'o', color=color, ms=8, mfc=color,
-                    label=f'{label} ({mstar:.2f} M$_\\odot$, {age:.1f} Gyr)')
+                # Best-fit point
+                logg_fit = np.log10(gravitysun * mstar / rstar**2)
+                ax.plot(teff, logg_fit, 'o', color=color, ms=8, mfc=color,
+                        label=f'{label} ({mstar:.2f} M$_\\odot$, {age:.1f} Gyr)')
 
-            # MIST model point at best-fit age
-            eep_idx = np.searchsorted(ages_iso, age)
-            eep_idx = np.clip(eep_idx, 1, len(ages_iso) - 1)
-            x = (age - ages_iso[eep_idx - 1]) / (ages_iso[eep_idx] - ages_iso[eep_idx - 1]) \
-                if ages_iso[eep_idx] != ages_iso[eep_idx - 1] else 0.0
-            mistteff = (1 - x) * teffs_iso[eep_idx - 1] + x * teffs_iso[eep_idx]
-            mistrstar = (1 - x) * rstars_iso[eep_idx - 1] + x * rstars_iso[eep_idx]
-            mistlogg = np.log10(gravitysun * mstar / mistrstar**2)
-            ax.plot(mistteff, mistlogg, 's', color=color, ms=6, mfc='none', mew=1.5)
+                # MIST model point at best-fit age
+                eep_idx = np.searchsorted(ages_iso, age)
+                eep_idx = np.clip(eep_idx, 1, len(ages_iso) - 1)
+                x = (age - ages_iso[eep_idx - 1]) / (ages_iso[eep_idx] - ages_iso[eep_idx - 1]) \
+                    if ages_iso[eep_idx] != ages_iso[eep_idx - 1] else 0.0
+                mistteff = (1 - x) * teffs_iso[eep_idx - 1] + x * teffs_iso[eep_idx]
+                mistrstar = (1 - x) * rstars_iso[eep_idx - 1] + x * rstars_iso[eep_idx]
+                mistlogg = np.log10(gravitysun * mstar / mistrstar**2)
+                ax.plot(mistteff, mistlogg, 's', color=color, ms=6, mfc='none', mew=1.5)
 
-        ax.set_xlabel(r'$T_{\rm eff}$ (K)')
-        ax.set_ylabel(r'$\log g$ (cgs)')
-        ax.invert_xaxis()
-        ax.invert_yaxis()
-        ax.legend(fontsize=8, loc='best')
+            ax.set_xlabel(r'$T_{\rm eff}$ (K)')
+            ax.set_ylabel(r'$\log g$ (cgs)')
+            ax.invert_xaxis()
+            ax.invert_yaxis()
+            ax.legend(fontsize=8, loc='best')
 
-        fig.savefig(outfile, dpi=150, bbox_inches='tight')
-        plt.close(fig)
+            fig.savefig(outfile, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+    except (FileNotFoundError, TypeError) as e:
+        print(f"Warning: Skipping MIST track plot ({e}). "
+              "MIST EEP track files may not be installed.")
 
 
 def _plot_single_star_track(bestfit, suffix, outfile, vvcrit, alpha, range_vals):
