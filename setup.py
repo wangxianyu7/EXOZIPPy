@@ -143,17 +143,27 @@ setup(
     # https://packaging.python.org/discussions/install-requires-vs-requirements/
     install_requires=[
         'numpy',
+        'scipy',
         'matplotlib',
         'astropy',
-        'celerite',
-        'pymc',
+        'numba',
+        'h5py',
         'corner',
-        'MulensModel',
-        'ipdb',
-        'lightkurve',
-        #'exoplanet', # built on pymc3, seems to have dependencies incompatible with pymc... doesn't bode well for our future...
-        #'batman', # do we need this?
-    ]
+        'pandas',
+        'emcee',
+        'ptemcee',
+        'requests',
+    ],
+
+    package_data={
+        'exozippy': [
+            'sed/filtercurves/*.idl',
+            'sed/mist/*.idl',
+            'mist/MIST_v1.0_tracks/**/*.eep',
+        ],
+    },
+
+    include_package_data=True,
 
     # List additional groups of dependencies here (e.g. development
     # dependencies). Users will be able to install these using the "extras"
