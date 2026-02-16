@@ -157,8 +157,10 @@ setup(
 
     package_data={
         'exozippy': [
+            'sed/*.txt',
             'sed/filtercurves/*.idl',
             'sed/mist/*.idl',
+            'sed/mist/*.txt',
             'mist/MIST_v1.0_tracks/**/*.eep',
         ],
     },
