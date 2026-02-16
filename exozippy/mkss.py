@@ -1,19 +1,444 @@
 """
-Lightweight mkss.py (non-PyMC).
+mkss.py — Build a Stellar System (SS) structure.
 
-Builds a plain-Python SS-like structure with stars/planets/transits/telescopes.
-Intended as a minimal, extensible analog of EXOFASTv2 mkss.pro.
+Analogous to EXOFASTv2's mkss.pro: constructs a nested structure
+(SS -> Star, Planet, Band, Transit, Telescope) that describes an
+arbitrary number of stars, planets, observed bands, RV telescopes,
+and observed transits.
+
+This structure is the single source of truth for parameter definitions,
+initial values, priors, bounds, and latex labels.
 """
+
 import glob
 import math
+import os
 import numpy as np
 
 from .mkconstants import mkconstants
 from .parameter import Parameter
-from .read_par import read_par
-from .read_tran import read_tran
-from .read_rv import read_rv
+from .ss import SS, Star, Planet, Band, Transit, Telescope
 
+
+# ── Helper: parse a prior file ────────────────────────────────────────
+
+def _parse_priors(parfile):
+    """
+    Parse an EXOFASTv2-style prior file.
+
+    Returns dict of dicts with keys: value, sigma, lower, upper.
+
+    Handles EXOFASTv2 log-space parameters:
+      logmstar → mstar = 10^logmstar
+      logk_N   → k_N   = 10^logk_N
+      logp_N   → period_N = 10^logp_N
+    Also maps planet-indexed params (tc_0→tc, p_0→p, cosi_0→cosi)
+    as aliases for backward compatibility.
+    """
+    if parfile is None:
+        return {}
+    priors = {}
+    with open(parfile) as f:
+        for line in f:
+            line = line.split('#')[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            name = parts[0]
+            vals = [float(x) for x in parts[1:]]
+            entry = {'value': vals[0], 'sigma': 0.0,
+                     'lower': np.nan, 'upper': np.nan}
+            if len(vals) >= 2:
+                entry['sigma'] = vals[1]
+            if len(vals) >= 3:
+                entry['lower'] = vals[2]
+            if len(vals) >= 4:
+                entry['upper'] = vals[3]
+            priors[name] = entry
+
+    # Convert log-space parameters to linear
+    _log_conversions = {
+        'logmstar': 'mstar',
+    }
+    # logk_N → k_N, logp_N → period_N (with index)
+    for key in list(priors.keys()):
+        if key.startswith('logk'):
+            suffix = key[4:]  # e.g. '_0'
+            linear_key = f'k{suffix}'
+            if linear_key not in priors:
+                entry = dict(priors[key])
+                entry['value'] = 10.0 ** entry['value']
+                priors[linear_key] = entry
+        elif key.startswith('logp'):
+            suffix = key[4:]  # e.g. '_0'
+            linear_key = f'period{suffix}'
+            if linear_key not in priors:
+                entry = dict(priors[key])
+                entry['value'] = 10.0 ** entry['value']
+                priors[linear_key] = entry
+        elif key in _log_conversions:
+            linear_key = _log_conversions[key]
+            if linear_key not in priors:
+                entry = dict(priors[key])
+                entry['value'] = 10.0 ** entry['value']
+                priors[linear_key] = entry
+
+    # Convert e/omega to sesinw/secosw if not already present
+    if 'e' in priors and 'sesinw' not in priors:
+        import math as _math
+        e_val = priors['e']['value']
+        omega_val = priors.get('omega', {}).get('value', _math.pi / 2)
+        sqrte = _math.sqrt(max(e_val, 0.0))
+        priors['sesinw'] = {'value': sqrte * _math.sin(omega_val), 'sigma': 0.0,
+                            'lower': np.nan, 'upper': np.nan}
+        priors['secosw'] = {'value': sqrte * _math.cos(omega_val), 'sigma': 0.0,
+                            'lower': np.nan, 'upper': np.nan}
+
+    # Map planet-indexed params to unsuffixed aliases (for single-planet compat)
+    # e.g. tc_0 → tc, p_0 → p, cosi_0 → cosi (and reverse: tc → tc_0)
+    _planet_aliases = ['tc', 'p', 'cosi', 'period']
+    for base in _planet_aliases:
+        key0 = f'{base}_0'
+        if key0 in priors and base not in priors:
+            priors[base] = priors[key0]
+        if base in priors and key0 not in priors:
+            priors[key0] = priors[base]
+
+    return priors
+
+
+def _prior_val(priors, key, default):
+    """Get prior value for a key, or default."""
+    return priors.get(key, {}).get('value', default)
+
+
+# ── Helper: make a Parameter with prior overrides ─────────────────────
+
+def _mkpar(label, priors, *, initval, lower=-np.inf, upper=np.inf,
+           latex='', description='', unit='', scale=0.0,
+           fit=False, derive=True):
+    """Create a Parameter, applying prior overrides if present."""
+    p = priors.get(label, {})
+    val = p.get('value', initval)
+    sigma = p.get('sigma', None)
+    plower = p.get('lower', np.nan)
+    pupper = p.get('upper', np.nan)
+
+    if sigma is not None and sigma == 0 and not np.isnan(val):
+        fit = False
+
+    # Tighten bounds if user specifies them
+    if np.isfinite(plower):
+        lower = max(lower, plower)
+    if np.isfinite(pupper):
+        upper = min(upper, pupper)
+
+    par = Parameter.__new__(Parameter)
+    par.value = val
+    par.unit = unit
+    par.label = label
+    par.latex = latex
+    par.latex_unit = unit
+    par.latex_value = None
+    par.description = description
+    par.latex_prefix = 'ez'
+    par.table_note = None
+    par.posterior = None
+    par.prior = val if sigma else None
+    par.gaussian_width = sigma if sigma and sigma > 0 else np.inf
+    par.lowerbound = lower
+    par.upperbound = upper
+    par.link = None
+    par.amoeba_scale = scale
+    par.userchanged = label in priors
+    par.fit = fit
+    par.derive = derive
+    par.medvalue = None
+    par.upper = None
+    par.lower = None
+    par.best = None
+    par.get_latex_var()
+    return par
+
+
+# ── Build Star ────────────────────────────────────────────────────────
+
+def _make_star(idx, priors, constants):
+    """Build a Star with IDL-matching parameter definitions."""
+    suffix = f'_{idx}' if idx > 0 else ''
+
+    mstar_init = _prior_val(priors, 'mstar', 1.0)
+    rstar_init = _prior_val(priors, 'rstar', 1.0)
+    teff_init = _prior_val(priors, 'teff', 5778.0)
+    feh_init = _prior_val(priors, 'feh', 0.0)
+    age_init = _prior_val(priors, 'age', 4.603)
+
+    if 'parallax' in priors:
+        dist_init = 1000.0 / priors['parallax']['value']
+    else:
+        dist_init = _prior_val(priors, 'distance', 10.0)
+
+    logg_init = math.log10(mstar_init / rstar_init**2 * constants['GravitySun'])
+    lstar_init = (4.0 * math.pi * rstar_init**2 * teff_init**4
+                  * constants['sigmab'] / constants['LSun'] * constants['RSun']**2)
+    rhostar_init = mstar_init / rstar_init**3 * constants['RhoSun']
+
+    return Star(
+        mstar=_mkpar(f'mstar{suffix}', priors, initval=mstar_init,
+                      lower=0.1, upper=250, scale=0.5,
+                      latex=r'M_*', description='Mass', unit=r'\msun', fit=True),
+        rstar=_mkpar(f'rstar{suffix}', priors, initval=rstar_init,
+                      lower=0.1, upper=2000, scale=0.5,
+                      latex=r'R_*', description='Radius', unit=r'\rsun', fit=True),
+        teff=_mkpar(f'teff{suffix}', priors, initval=teff_init,
+                     lower=1.0, upper=50000, scale=500,
+                     latex=r'T_{\rm eff}', description='Effective Temperature', unit='K', fit=True),
+        feh=_mkpar(f'feh{suffix}', priors, initval=feh_init,
+                    lower=-5.0, upper=5.0, scale=0.5,
+                    latex=r'[{\rm Fe/H}]', description='Metallicity', unit='dex', fit=True),
+        logg=_mkpar(f'logg{suffix}', priors, initval=logg_init,
+                     scale=0.3,
+                     latex=r'\log{g}', description='Surface gravity', unit='cgs'),
+        lstar=_mkpar(f'lstar{suffix}', priors, initval=lstar_init,
+                      latex=r'L_*', description='Luminosity', unit=r'\lsun'),
+        rhostar=_mkpar(f'rhostar{suffix}', priors, initval=rhostar_init,
+                        latex=r'\rho_*', description='Density', unit='cgs'),
+        age=_mkpar(f'age{suffix}', priors, initval=age_init,
+                    lower=0.0, upper=15.0, scale=3.0,
+                    latex='Age', description='Age', unit='Gyr'),
+        eep=_mkpar(f'eep{suffix}', priors, initval=354.17,
+                    scale=50,
+                    latex='EEP', description='Equal Evolutionary Phase'),
+        av=_mkpar('av', priors, initval=0.01,
+                   lower=0.0, upper=10.0, scale=0.3,
+                   latex=r'A_V', description='V-band extinction', unit='mag'),
+        distance=_mkpar(f'distance{suffix}', priors, initval=dist_init,
+                         lower=1.0, upper=1e6, scale=100,
+                         latex='d', description='Distance', unit='pc'),
+        parallax=_mkpar(f'parallax{suffix}', priors, initval=1000.0 / dist_init,
+                         scale=100,
+                         latex=r'\varpi', description='Parallax', unit='mas'),
+        label=chr(65 + idx),  # 'A', 'B', 'C', ...
+    )
+
+
+# ── Build Planet ──────────────────────────────────────────────────────
+
+def _make_planet(idx, priors, constants, circular=True, fittran=True, fitrv=True,
+                 usevcve=False):
+    """Build a Planet with IDL-matching parameter definitions."""
+    suffix = f'_{idx}'
+
+    period_init = _prior_val(priors, f'period{suffix}',
+                             _prior_val(priors, 'period_0', 3.0))
+    tc_init = _prior_val(priors, 'tc', 0.0)
+    p_init = _prior_val(priors, 'p', 0.1)
+    cosi_init = _prior_val(priors, 'cosi', 0.05)
+    K_init = _prior_val(priors, f'k{suffix}',
+                         _prior_val(priors, 'k_0', 50.0))
+
+    e_val = 0.0 if circular else _prior_val(priors, 'e', 0.0)
+    omega_val = math.pi / 2 if circular else _prior_val(priors, 'omega', math.pi / 2)
+    sqrte = math.sqrt(e_val)
+    sesinw_val = sqrte * math.sin(omega_val)
+    secosw_val = sqrte * math.cos(omega_val)
+
+    # Vc/Ve parameterization: compute initial vcve from e/omega
+    if e_val > 0 and e_val < 1:
+        vcve_val = math.sqrt(1.0 - e_val**2) / (1.0 + e_val * math.sin(omega_val))
+    else:
+        vcve_val = 1.0  # circular
+    lsinw_val = _prior_val(priors, 'lsinw', 0.5 * math.sin(omega_val))
+    lcosw_val = _prior_val(priors, 'lcosw', 0.5 * math.cos(omega_val))
+    sign_val = _prior_val(priors, 'sign', 0.0)
+
+    # Eccentricity fit flags:
+    # - circular → nothing fitted
+    # - usevcve → fit vcve/lsinw/lcosw/sign (transit-only)
+    # - else → fit sesinw/secosw (RV available)
+    fit_sesinw = (not circular) and (not usevcve)
+    fit_vcve = (not circular) and usevcve
+
+    return Planet(
+        period=_mkpar(f'period{suffix}', priors, initval=period_init,
+                       lower=1e-6, upper=1e6, scale=0.01,
+                       latex='P', description='Period', unit='days', fit=True),
+        tc=_mkpar('tc', priors, initval=tc_init,
+                   scale=0.1,
+                   latex=r'T_C', description='Time of conjunction', unit=r'\bjdtdb', fit=True),
+        p=_mkpar('p', priors, initval=p_init,
+                  lower=-0.5, upper=1.0, scale=0.1,
+                  latex=r'R_P/R_*', description='Radius of planet in stellar radii', fit=True),
+        cosi=_mkpar('cosi', priors, initval=cosi_init,
+                     lower=0.0, upper=1.0, scale=0.1,
+                     latex=r'\cos{i}', description='Cos of inclination', fit=True),
+        K=_mkpar(f'k{suffix}', priors, initval=K_init,
+                  lower=0.0, upper=1e4, scale=5000,
+                  latex='K', description='RV semi-amplitude', unit='m/s', fit=True),
+        e=_mkpar('e', priors, initval=e_val,
+                  lower=0.0, upper=1.0,
+                  latex='e', description='Eccentricity'),
+        omega=_mkpar('omega', priors, initval=omega_val,
+                      latex=r'\omega_*', description='Argument of periastron', unit='Radians'),
+        sesinw=_mkpar('sesinw', priors, initval=sesinw_val,
+                       lower=-1.0, upper=1.0, scale=0.1,
+                       latex=r'\sqrt{e}\sin{\omega_*}', description='',
+                       fit=fit_sesinw),
+        secosw=_mkpar('secosw', priors, initval=secosw_val,
+                       lower=-1.0, upper=1.0, scale=0.1,
+                       latex=r'\sqrt{e}\cos{\omega_*}', description='',
+                       fit=fit_sesinw),
+        vcve=_mkpar('vcve', priors, initval=vcve_val,
+                     lower=0.0, upper=1.0, scale=0.05,
+                     latex=r'V_c/V_e', description='Circ/ecc velocity ratio',
+                     fit=fit_vcve),
+        lsinw=_mkpar('lsinw', priors, initval=lsinw_val,
+                      lower=-1.0, upper=1.0, scale=0.1,
+                      latex=r'L\sin{\omega_*}', description='',
+                      fit=fit_vcve),
+        lcosw=_mkpar('lcosw', priors, initval=lcosw_val,
+                      lower=-1.0, upper=1.0, scale=0.1,
+                      latex=r'L\cos{\omega_*}', description='',
+                      fit=fit_vcve),
+        sign=_mkpar('sign', priors, initval=sign_val,
+                     lower=-1.0, upper=2.0, scale=0.1,
+                     latex='sign', description='vcve quadratic root selector',
+                     fit=fit_vcve),
+        # Derived (initial placeholders, recomputed by ss.compute_derived())
+        ar=_mkpar(f'ar{suffix}', priors, initval=10.0,
+                   latex=r'a/R_*', description='Semi-major axis in stellar radii'),
+        b=_mkpar(f'b{suffix}', priors, initval=0.5,
+                  latex='b', description='Transit impact parameter'),
+        inc_rad=_mkpar(f'inc{suffix}', priors, initval=math.acos(cosi_init),
+                        latex='i', description='Inclination', unit='Radians'),
+        ideg=_mkpar(f'ideg{suffix}', priors, initval=math.degrees(math.acos(cosi_init)),
+                     latex='i', description='Inclination', unit='Degrees'),
+        delta=_mkpar(f'delta{suffix}', priors, initval=p_init**2,
+                      latex=r'\delta', description='Transit depth', unit='frac'),
+        mp=_mkpar(f'mp{suffix}', priors, initval=0.0,
+                   latex=r'M_P', description='Mass', unit=r'\mj'),
+        rp=_mkpar(f'rp{suffix}', priors, initval=0.0,
+                   latex=r'R_P', description='Radius', unit=r'\rj'),
+        a=_mkpar(f'a{suffix}', priors, initval=0.0,
+                  latex='a', description='Semi-major axis', unit='AU'),
+        teq=_mkpar(f'teq{suffix}', priors, initval=0.0,
+                    latex=r'T_{\rm eq}', description='Equilibrium temperature', unit='K'),
+        beam=_mkpar('beam', priors, initval=_prior_val(priors, 'beam', 0.0),
+                     lower=-500, upper=500, scale=5.0,
+                     latex=r'A_B', description='Doppler beaming amplitude', unit='ppm'),
+        ellipsoidal=_mkpar('ellipsoidal', priors, initval=_prior_val(priors, 'ellipsoidal', 0.0),
+                            lower=0.0, upper=500, scale=5.0,
+                            latex=r'A_{\rm ellip}', description='Ellipsoidal variation amplitude', unit='ppm'),
+        fittran=fittran,
+        fitrv=fitrv,
+        circular=circular,
+        label='b' if idx == 0 else chr(99 + idx),  # b, c, d, ...
+    )
+
+
+# ── Build Band ────────────────────────────────────────────────────────
+
+def _make_band(name, idx, priors):
+    """Build a Band (per-wavelength limb darkening)."""
+    suffix = f'_{idx}'
+    return Band(
+        u1=_mkpar(f'u1{suffix}', priors, initval=0.4,
+                   lower=0.0, upper=2.0,
+                   latex=r'u_1', description='Linear limb-darkening coeff', fit=True),
+        u2=_mkpar(f'u2{suffix}', priors, initval=0.2,
+                   lower=-1.0, upper=1.0,
+                   latex=r'u_2', description='Quadratic limb-darkening coeff', fit=True),
+        thermal=_mkpar(f'thermal{suffix}', priors,
+                        initval=_prior_val(priors, f'thermal{suffix}', 0.0),
+                        lower=0.0, upper=5000, scale=50.0,
+                        latex=r'A_{\rm therm}', description='Thermal emission', unit='ppm'),
+        reflect=_mkpar(f'reflect{suffix}', priors,
+                        initval=_prior_val(priors, f'reflect{suffix}', 0.0),
+                        lower=0.0, upper=5000, scale=20.0,
+                        latex=r'A_{\rm refl}', description='Reflected light', unit='ppm'),
+        name=name,
+        label=name,
+    )
+
+
+# ── Build Transit ────────────────────────────────────────────────────
+
+def _make_transit(tranfile, idx, priors, tc=None, period=None, fitttv=False):
+    """Build a Transit from a data file."""
+    data = np.loadtxt(tranfile, comments='#')
+    bjd = data[:, 0]
+    flux = data[:, 1]
+    err = data[:, 2]
+
+    basename = os.path.basename(tranfile)
+
+    # Compute integer epoch from linear ephemeris
+    epoch = 0
+    if tc is not None and period is not None and period > 0:
+        epoch = int(round((float(np.median(bjd)) - tc) / period))
+
+    suffix = f'_{idx}'
+    return Transit(
+        f0=_mkpar(f'f0{suffix}', priors, initval=float(np.median(flux)),
+                   lower=0.0, upper=2.0, scale=0.001,
+                   latex=r'F_0', description='Baseline flux', fit=True),
+        variance=_mkpar(f'variance{suffix}', priors, initval=0.0,
+                         lower=0.0,
+                         latex=r'\sigma_j^2', description='Added variance'),
+        ttv=_mkpar(f'ttv{suffix}', priors, initval=0.0,
+                    scale=0.02,
+                    latex=r'TTV', description='Transit timing variation',
+                    unit='days', fit=fitttv),
+        bjd=bjd,
+        flux=flux,
+        err=err,
+        epoch=epoch,
+        name=basename,
+        label=basename,
+    )
+
+
+# ── Build Telescope ──────────────────────────────────────────────────
+
+def _make_telescope(rvfile, idx, priors):
+    """Build a Telescope from an RV data file."""
+    data = np.loadtxt(rvfile, comments='#')
+    bjd = data[:, 0]
+    vel = data[:, 1]
+    err = data[:, 2]
+
+    basename = os.path.basename(rvfile)
+    label = (os.path.splitext(basename)[0].split('.')[1]
+             if '.' in basename else f'RV{idx}')
+
+    suffix = f'_{idx}'
+    gamma_init = _prior_val(priors, f'gamma{suffix}',
+                             _prior_val(priors, 'gamma_0', 0.0))
+    jittervar_init = _prior_val(priors, 'jittervar', 0.0)
+
+    return Telescope(
+        gamma=_mkpar(f'gamma{suffix}', priors, initval=gamma_init,
+                      lower=-1e5, upper=1e5, scale=5000,
+                      latex=r'\gamma_{\rm rel}', description='Relative RV Offset',
+                      unit='m/s', fit=True),
+        jittervar=_mkpar(f'jittervar{suffix}', priors, initval=jittervar_init,
+                          lower=0.0,
+                          latex=r'\sigma_J^2', description='RV Jitter Variance',
+                          unit='m^2/s^2'),
+        jitter=_mkpar(f'jitter{suffix}', priors,
+                       initval=math.sqrt(max(jittervar_init, 0.0)),
+                       latex=r'\sigma_J', description='RV Jitter', unit='m/s'),
+        bjd=bjd,
+        vel=vel,
+        err=err,
+        name=basename,
+        label=label,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Main entry point
+# ══════════════════════════════════════════════════════════════════════
 
 def mkss(
     parfile=None,
@@ -25,135 +450,160 @@ def mkss(
     fittran=True,
     fitrv=True,
     circular=True,
-    ttvs=False,
-    tivs=False,
-    tdeltavs=False,
+    use_mist=False,
+    fitjittervar=False,
+    fitvariance=False,
+    fitthermal=False,
+    fitreflect=False,
+    fitbeam=False,
+    fitellip=False,
+    usevcve=False,
+    fitttv=False,
 ):
     """
-    Construct a minimal SS-like dict for EXOZIPPy (no PyMC dependency).
+    Construct a Stellar System (SS) structure.
+
+    Analogous to EXOFASTv2's mkss.pro.
+
+    Parameters
+    ----------
+    parfile : str
+        Path to the prior file.
+    tranpath : str
+        Glob pattern for transit light curve files.
+    rvpath : str
+        Glob pattern for RV data files.
+    sedfile : str
+        Path to the SED definition file.
+    nstars, nplanets : int
+        Number of stars / planets.
+    fittran, fitrv : bool or list[bool]
+        Whether to fit transit / RV for each planet.
+    circular : bool or list[bool]
+        Whether each planet's orbit is circular.
+    use_mist : bool
+        Use MIST evolutionary models.
+    usevcve : bool
+        Use Vc/Ve eccentricity parameterization (transit-only).
+
+    Returns
+    -------
+    SS
+        The stellar system structure.
     """
     const = mkconstants()
-    user_params = read_par(parfile) if parfile else {}
+    priors = _parse_priors(parfile)
 
-    # Data inputs
-    tranfiles = glob.glob(tranpath) if tranpath else []
-    rvfiles = glob.glob(rvpath) if rvpath else []
+    # Data file discovery
+    tranfiles = sorted(glob.glob(tranpath)) if tranpath else []
+    rvfiles = sorted(glob.glob(rvpath)) if rvpath else []
 
-    # Handle scalar/array flags
+    # Broadcast scalar flags to per-planet arrays
     if np.isscalar(fittran):
-        fittran = np.zeros((nplanets,), dtype=bool) + bool(fittran)
+        fittran = [bool(fittran)] * nplanets
     if np.isscalar(fitrv):
-        fitrv = np.zeros((nplanets,), dtype=bool) + bool(fitrv)
-    if np.isscalar(ttvs):
-        ttvs = np.zeros((len(tranfiles),), dtype=bool) + bool(ttvs)
-    if np.isscalar(tivs):
-        tivs = np.zeros((len(tranfiles),), dtype=bool) + bool(tivs)
-    if np.isscalar(tdeltavs):
-        tdeltavs = np.zeros((len(tranfiles),), dtype=bool) + bool(tdeltavs)
+        fitrv = [bool(fitrv)] * nplanets
     if np.isscalar(circular):
-        circular = np.zeros((nplanets,), dtype=bool) + bool(circular)
+        circular_list = [bool(circular)] * nplanets
+    else:
+        circular_list = list(circular)
 
-    starnames = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+    # ── Build sub-structures ──
 
-    ss = {
-        "constants": const,
-        "nstars": nstars,
-        "nplanets": nplanets,
-        "sedfile": sedfile,
-        "star": [],
-        "planet": [],
-        "transit": [],
-        "telescope": [],
-        "fittran": fittran,
-        "fitrv": fitrv,
-        "circular": circular,
-    }
+    stars = [_make_star(i, priors, const) for i in range(nstars)]
+    planets = [_make_planet(i, priors, const,
+                             circular=circular_list[i],
+                             fittran=fittran[i],
+                             fitrv=fitrv[i],
+                             usevcve=usevcve)
+               for i in range(nplanets)]
 
-    # --- Stars ---
+    # Bands (one per unique transit band; for now just one default)
+    bands = [_make_band('default', 0, priors)]
+
+    # Get tc/period for epoch computation
+    tc_init = _prior_val(priors, 'tc', 0.0)
+    period_init = _prior_val(priors, 'period_0', _prior_val(priors, 'period', 3.0))
+    # Need at least 3 transits for TTV (2-param linear fit needs ≥3 points)
+    _fitttv = fitttv and len(tranfiles) >= 3
+    transits = [_make_transit(f, i, priors, tc=tc_init, period=period_init,
+                              fitttv=_fitttv)
+                for i, f in enumerate(tranfiles)]
+    telescopes = [_make_telescope(f, i, priors) for i, f in enumerate(rvfiles)]
+
+    # ── Build param_names (matches exozippy_chi2.py ordering) ──
+
+    has_sed = sedfile is not None and str(sedfile) != ''
+    param_names = []
+    # Stellar parameters (per star)
+    stellar_fit = ['teff', 'rstar', 'feh', 'av', 'distance'] if has_sed else ['teff', 'rstar', 'feh']
+    stellar_mist = ['logmstar', 'age']
     for i in range(nstars):
-        star = {
-            "rootlabel": "Stellar Parameters:",
-            "label": starnames[i],
-            "mstar": Parameter(f"mstar_{i}", lower=1e-1, upper=250, initval=1.0,
-                               latex="M_*", description="Mass", latex_unit="\\msun",
-                               user_params=user_params),
-            "rstar": Parameter(f"rstar_{i}", lower=1e-1, upper=2000, initval=1.0,
-                               latex="R_*", description="Radius", latex_unit="\\rsun",
-                               user_params=user_params),
-            "teff": Parameter(f"teff_{i}", lower=1.0, upper=5e5, initval=5778,
-                              latex="T_{\\rm eff}", description="Effective Temperature",
-                              latex_unit="K", user_params=user_params),
-            "feh": Parameter(f"feh_{i}", lower=-5.0, upper=5.0, initval=0.0,
-                             latex="[{\\rm Fe/H}]", description="Metallicity",
-                             latex_unit="dex", user_params=user_params),
-            "distance": Parameter(f"distance_{i}", lower=1.0, upper=1e6, initval=100.0,
-                                  latex="d", description="Distance", latex_unit="pc",
-                                  user_params=user_params),
-        }
+        suffix = f'_{i}' if nstars > 1 else ''
+        if use_mist:
+            param_names.extend([f'{p}{suffix}' for p in stellar_mist])
+        param_names.extend([f'{p}{suffix}' for p in stellar_fit])
+    # Shared orbital parameters
+    param_names.extend(['tc', 'logP', 'p', 'cosi', 'K'])
+    # Eccentricity (when non-circular)
+    if not all(circular_list):
+        if usevcve:
+            param_names.extend(['vcve', 'lsinw', 'lcosw', 'sign'])
+        else:
+            param_names.extend(['sesinw', 'secosw'])
+    # Per-band limb darkening
+    for j in range(len(bands)):
+        param_names.extend([f'u1_{j}', f'u2_{j}'])
+    # Per-band phase curve params
+    if fitthermal:
+        for j in range(len(bands)):
+            param_names.append(f'thermal_{j}')
+    if fitreflect:
+        for j in range(len(bands)):
+            param_names.append(f'reflect_{j}')
+    # Per-transit normalization
+    for j in range(len(transits)):
+        param_names.append(f'f0_{j}')
+    # Per-transit variance (jitter)
+    if fitvariance:
+        for j in range(len(transits)):
+            param_names.append(f'variance_{j}')
+    # Per-transit TTV
+    if _fitttv:
+        for j in range(len(transits)):
+            param_names.append(f'ttv_{j}')
+    # Per-telescope gamma
+    for j in range(len(telescopes)):
+        param_names.append(f'gamma_{j}')
+    # Per-telescope jittervar
+    if fitjittervar:
+        for j in range(len(telescopes)):
+            param_names.append(f'jittervar_{j}')
+    # Per-planet phase curve params
+    if fitbeam:
+        param_names.append('beam')
+    if fitellip:
+        param_names.append('ellipsoidal')
 
-        # Derived values (numeric)
-        mstar = float(star["mstar"].value)
-        rstar = float(star["rstar"].value)
-        teff = float(star["teff"].value)
-        star["logg"] = Parameter(
-            f"logg_{i}",
-            initval=math.log10(mstar / rstar**2 * const["GravitySun"]),
-            latex="\\log{g}", description="Surface gravity",
-            latex_unit="cgs", user_params=user_params,
-        )
-        star["rhostar"] = Parameter(
-            f"rhostar_{i}",
-            initval=mstar / (rstar**3) * const["RhoSun"],
-            latex="\\rho_*", description="Density",
-            latex_unit="cgs", user_params=user_params,
-        )
-        star["lstar"] = Parameter(
-            f"lstar_{i}",
-            initval=4.0 * math.pi * rstar**2 * teff**4 * const["sigmab"] / const["LSun"] * const["RSun"]**2,
-            latex="L_*", description="Luminosity",
-            latex_unit="\\lsun", user_params=user_params,
-        )
+    # ── Assemble SS ──
 
-        ss["star"].append(star)
+    ss = SS(
+        star=stars,
+        planet=planets,
+        band=bands,
+        transit=transits,
+        telescope=telescopes,
+        constants=const,
+        nstars=nstars,
+        nplanets=nplanets,
+        use_mist=use_mist,
+        param_names=param_names,
+        sedfile=str(sedfile) if sedfile else '',
+        tranpath=str(tranpath) if tranpath else '',
+        rvpath=str(rvpath) if rvpath else '',
+    )
 
-    # --- Planets (minimal set) ---
-    for i in range(nplanets):
-        planet = {
-            "rootlabel": "Planetary Parameters:",
-            "label": f"b{i}",
-            "period": Parameter(f"period_{i}", lower=1e-6, upper=1e6, initval=3.0,
-                                latex="P", description="Period", latex_unit="days",
-                                user_params=user_params),
-            "tc": Parameter(f"tc_{i}", lower=-np.inf, upper=np.inf, initval=0.0,
-                            latex="T_C", description="Transit time", latex_unit="\\bjdtdb",
-                            user_params=user_params),
-            "p": Parameter(f"p_{i}", lower=1e-4, upper=1.0, initval=0.1,
-                           latex="R_P/R_*", description="Radius ratio",
-                           latex_unit="", user_params=user_params),
-            "cosi": Parameter(f"cosi_{i}", lower=0.0, upper=1.0, initval=0.05,
-                              latex="\\cos i", description="Cosine inclination",
-                              latex_unit="", user_params=user_params),
-            "K": Parameter(f"k_{i}", lower=0.0, upper=1e4, initval=50.0,
-                           latex="K", description="RV semi-amplitude",
-                           latex_unit="m/s", user_params=user_params),
-            "gamma": Parameter(f"gamma_{i}", lower=-1e4, upper=1e4, initval=0.0,
-                               latex="\\gamma", description="RV offset",
-                               latex_unit="m/s", user_params=user_params),
-        }
-        ss["planet"].append(planet)
-
-    # --- Transits ---
-    for i, fname in enumerate(tranfiles):
-        transit = read_tran(fname, ndx=i, tiv=tivs[i], ttv=ttvs[i], tdeltav=tdeltavs[i],
-                            user_params=user_params)
-        ss["transit"].append(transit)
-
-    # --- Telescopes (RV) ---
-    for i, fname in enumerate(rvfiles):
-        rv = read_rv(fname)
-        rv["rootlabel"] = "Telescope Parameters:"
-        rv["label"] = rv.get("label", f"RV{i}")
-        ss["telescope"].append(rv)
+    # Compute derived quantities from initial values
+    ss.compute_derived()
 
     return ss
-

@@ -241,20 +241,30 @@ def massradius_mist(mstar, feh, age, teff, rstar, vvcrit=None, alpha=None, span=
     if debug and not plot_target:
         plot_target = Path.cwd() / "mist_track_debug.png"
     if plot_target:
-        _plot_mist_track(
-            teffs,
-            rstars,
-            ages,
-            mstar,
-            feh,
-            age,
-            teff,
-            rstar,
-            gravitysun,
-            eep_index=eep,
-            outfile=str(plot_target),
-            range_vals=range,
-        )
+        try:
+            teffs_iso, rstars_iso, ages_iso, eeps_iso = _interpolate_track_for_plot(
+                mstar, feh, vvcrit=vvcrit, alpha=alpha
+            )
+            if len(teffs_iso) > 0:
+                _plot_mist_track(
+                    teffs_iso,
+                    rstars_iso,
+                    ages_iso,
+                    eeps_iso,
+                    mstar,
+                    feh,
+                    age,
+                    teff,
+                    rstar,
+                    gravitysun,
+                    mistteff=mistteff,
+                    mistrstar=mistrstar,
+                    eep_best=eep,
+                    outfile=str(plot_target),
+                    range_vals=range,
+                )
+        except (ValueError, IndexError):
+            pass
     return chi2
 
 
@@ -265,16 +275,126 @@ def _write_track_file(path, teffs, rstars, ages):
     np.savetxt(path, data, header=header)
 
 
-def _plot_mist_track(teffs, rstars, ages, mstar, feh, age, teff, rstar,
-                     gravitysun, eep_index, outfile=None, range_vals=None):
-    import matplotlib
+def _interpolate_track_for_plot(mstar, feh, vvcrit=None, alpha=None):
+    """
+    Interpolate an evolutionary track at exact (mstar, feh) for all EEPs.
 
+    Matches IDL massradius_mist.pro plotting logic: for each EEP from 1 to 808,
+    trilinearly interpolate over (EEP, mass, [Fe/H]) using the 4 surrounding
+    grid tracks (2 mass x 2 feh).
+
+    Returns
+    -------
+    teffs_iso, rstars_iso, ages_iso, eeps : ndarray
+        Interpolated Teff, Rstar, age, and EEP number at each valid point.
+    """
+    vvcritndx = 0 if vvcrit is None else _vvcrit_index(vvcrit)
+    alphandx = 0 if alpha is None else _alpha_index(alpha)
+
+    # Find bracketing mass indices (matches IDL logic)
+    massndx = _mass_index(mstar)
+    if mstar < ALLOWED_MASS[massndx]:
+        minmassndx = max(massndx - 1, 0)
+    else:
+        minmassndx = min(massndx, len(ALLOWED_MASS) - 2)
+
+    fehndx = _feh_index(feh)
+    if feh < ALLOWED_INITFEH[fehndx]:
+        minfehndx = max(fehndx - 1, 0)
+    else:
+        minfehndx = min(fehndx, len(ALLOWED_INITFEH) - 2)
+
+    mstarbox = ALLOWED_MASS[minmassndx:minmassndx + 2]
+    fehbox = ALLOWED_INITFEH[minfehndx:minfehndx + 2]
+
+    y_mass = (mstar - mstarbox[0]) / (mstarbox[1] - mstarbox[0]) if mstarbox[1] != mstarbox[0] else 0.0
+    z_feh = (feh - fehbox[0]) / (fehbox[1] - fehbox[0]) if fehbox[1] != fehbox[0] else 0.0
+
+    # Load the 4 corner tracks
+    corner_tracks = []
+    for i in range(2):
+        for j in range(2):
+            ages_c, rstars_c, teffs_c, _, _ = _get_track_tuple_cached(
+                minmassndx + i, minfehndx + j, vvcritndx, alphandx
+            )
+            corner_tracks.append((ages_c, rstars_c, teffs_c))
+
+    # Sweep EEP from 1 to 808 (IDL convention)
+    max_eep = 808
+    teffs_iso = np.full(max_eep, np.nan)
+    rstars_iso = np.full(max_eep, np.nan)
+    ages_iso = np.full(max_eep, np.nan)
+
+    for eep_val in range(1, max_eep + 1):
+        eepndx = eep_val - 1  # 0-based index into track arrays
+
+        # Build 2x2x2 cube for trilinear interpolation (eep x mass x feh)
+        vals_ok = True
+        all_ages = np.zeros((2, 2, 2))
+        all_rstars = np.zeros((2, 2, 2))
+        all_teffs = np.zeros((2, 2, 2))
+
+        idx = 0
+        for i in range(2):
+            for j in range(2):
+                ages_c, rstars_c, teffs_c = corner_tracks[idx]
+                idx += 1
+                neep_c = len(ages_c)
+                mineepndx = min(eepndx, neep_c - 2)
+                if mineepndx < 0 or mineepndx + 1 >= neep_c:
+                    vals_ok = False
+                    break
+                all_ages[:, i, j] = ages_c[mineepndx:mineepndx + 2]
+                all_rstars[:, i, j] = rstars_c[mineepndx:mineepndx + 2]
+                all_teffs[:, i, j] = teffs_c[mineepndx:mineepndx + 2]
+            if not vals_ok:
+                break
+
+        if not vals_ok:
+            continue
+
+        eepbox_lo = mineepndx + 1  # 1-based
+        eepbox_hi = mineepndx + 2
+        x_eep = (eep_val - eepbox_lo) / (eepbox_hi - eepbox_lo) if eepbox_hi != eepbox_lo else 0.0
+
+        # Trilinear interpolation (matches IDL interpolate)
+        def _trilinear(cube, x, y, z):
+            c00 = cube[0, 0, 0] * (1 - x) + cube[1, 0, 0] * x
+            c01 = cube[0, 0, 1] * (1 - x) + cube[1, 0, 1] * x
+            c10 = cube[0, 1, 0] * (1 - x) + cube[1, 1, 0] * x
+            c11 = cube[0, 1, 1] * (1 - x) + cube[1, 1, 1] * x
+            c0 = c00 * (1 - y) + c10 * y
+            c1 = c01 * (1 - y) + c11 * y
+            return c0 * (1 - z) + c1 * z
+
+        teffs_iso[eep_val - 1] = _trilinear(all_teffs, x_eep, y_mass, z_feh)
+        rstars_iso[eep_val - 1] = _trilinear(all_rstars, x_eep, y_mass, z_feh)
+        ages_iso[eep_val - 1] = _trilinear(all_ages, x_eep, y_mass, z_feh)
+
+    eeps = np.arange(1, max_eep + 1, dtype=float)
+    good = np.isfinite(teffs_iso) & np.isfinite(rstars_iso) & np.isfinite(ages_iso)
+    return teffs_iso[good], rstars_iso[good], ages_iso[good], eeps[good]
+
+
+def _plot_mist_track(teffs, rstars, ages, eeps, mstar, feh, age, teff, rstar,
+                     gravitysun, mistteff, mistrstar, eep_best=None,
+                     outfile=None, range_vals=None):
+    """
+    Plot the MIST HR diagram (Teff vs logg).
+
+    Matches IDL massradius_mist.pro plotting:
+    - Black line: interpolated evolutionary track at exact (mstar, feh)
+    - Black dot: best-fit (input) point
+    - Red asterisk: MIST model point (interpolated at the best-fit EEP)
+    """
+    import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     teffs = np.asarray(teffs, dtype=float)
     rstars = np.asarray(rstars, dtype=float)
     ages = np.asarray(ages, dtype=float)
+    eeps = np.asarray(eeps, dtype=float)
 
     safe_rstars = np.clip(rstars, 1e-6, None)
     track_logg = np.log10((mstar / (safe_rstars**2)) * gravitysun)
@@ -282,60 +402,59 @@ def _plot_mist_track(teffs, rstars, ages, mstar, feh, age, teff, rstar,
     if not np.any(finite):
         return
 
-    # Filter track: logg in [3, 5] and age <= 14 Gyr (age of universe)
-    # Matches IDL: excludes PMS (logg<3), post-AGB/WD (age>14 Gyr), and extreme stages
-    use = finite & (track_logg > 3) & (track_logg < 5) & (ages <= 14.0)
+    # IDL line 348-350: filter by EEP >= 202 (ZAMS) unless best-fit EEP is
+    # near the end of the track, and logg in [3, 5]
+    ZAMS_EEP = 202
+    if eep_best is not None and (eep_best + 3) > np.max(eeps):
+        min_eep = 1
+    else:
+        min_eep = ZAMS_EEP
+    # IDL: eepplot >= min([mineep, eep])
+    eep_cutoff = min(min_eep, eep_best) if eep_best is not None else min_eep
+    use = finite & (track_logg > 3) & (track_logg < 5) & (eeps >= eep_cutoff)
     if not np.any(use):
-        use = finite  # fallback to full track
+        use = finite
 
     teff_vals = teffs[use]
     logg_vals = track_logg[use]
 
     logg_best = np.log10((mstar / (max(rstar, 1e-6)**2)) * gravitysun)
-    eep_index = int(np.clip(eep_index, 0, len(teffs) - 1))
+    logg_mist = np.log10((mstar / (max(mistrstar, 1e-6)**2)) * gravitysun)
 
     fig, ax = plt.subplots(figsize=(6, 5.5))
-    ax.plot(teff_vals, logg_vals, color="black", lw=1.5, label="MIST track")
-    ax.scatter([teff], [logg_best], color="tab:red", s=35, zorder=5, label="Best fit")
-    ax.scatter(
-        [teffs[eep_index]],
-        [track_logg[eep_index]],
-        marker="s",
-        color="tab:blue",
-        s=40,
-        zorder=6,
-        label="Nearest grid point",
-    )
+    ax.plot(teff_vals, logg_vals, color="black", lw=1.0)
+
+    # Black dot: input (best-fit) point (IDL: psym=8, black)
+    ax.plot([teff], [logg_best], 'o', color='black', ms=6, zorder=5)
+    # Red asterisk: MIST interpolated point (IDL: psym=2, red)
+    ax.plot([mistteff], [logg_mist], '*', color='red', ms=12, zorder=6)
 
     if range_vals and len(range_vals) >= 4:
         xmin, xmax, ymin, ymax = range_vals[:4]
     else:
-        # IDL convention: include best-fit point with ±10% padding and track range
+        # IDL convention (line 353-354)
         xmin = max(np.max(teff_vals), teff * 1.1, teff * 0.9)
         xmax = min(np.min(teff_vals), teff * 0.9, teff * 1.1)
-        # Round to 100 K boundaries
         xmin = int(np.ceil(xmin / 100)) * 100
         xmax = int(np.floor(xmax / 100)) * 100
-        # IDL convention: logg range includes best-fit, clamp to [3, 5]
-        ymin = max(logg_best, np.max(logg_vals), 3.0)
-        ymax = min(logg_best, np.min(logg_vals), 5.0)
-        # Add padding
-        dy = ymin - ymax
-        ypad = max(dy * 0.1, 0.1)
-        ymin += ypad
-        ymax -= ypad
+        # IDL: ymax = min([loggplot,3,5,loggplottrack]), ymin = max(...)
+        ymax = min(logg_best, 3.0, np.min(logg_vals))
+        ymin = max(logg_best, 5.0, np.max(logg_vals))
+        # IDL tick spacing: expand to 4 equally spaced ticks on 100 K boundaries
+        spacing = int(np.ceil((xmin - xmax) / 3 / 100)) * 100
+        if spacing > 0:
+            while (xmin - xmax) / spacing != 3:
+                xmin += 100
+                xmax -= 100
+                spacing = int(np.ceil((xmin - xmax) / 3 / 100)) * 100
+                if xmin - xmax > 5000:
+                    break
 
-    # IDL HR diagram convention: both axes inverted
-    # xrange = [xmin, xmax] with xmin > xmax (hot on left)
-    # yrange = [ymin, ymax] with ymin > ymax (high logg at bottom, low logg at top)
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
 
     ax.set_xlabel(r"$T_{\mathrm{eff}}$ (K)")
     ax.set_ylabel(r"$\log g_\star$ (cgs)")
-    ax.set_title(f"MIST track: M={mstar:.2f} M$_\odot$, [Fe/H]={feh:+.2f}, age={age:.2f} Gyr")
-    ax.legend(loc="best")
-    ax.grid(alpha=0.3, ls="--")
 
     outfile = outfile or "mist_track.png"
     fig.tight_layout()
@@ -346,12 +465,91 @@ def _plot_mist_track(teffs, rstars, ages, mstar, feh, age, teff, rstar,
 def plot_mist_track(bestfit, outfile, vvcrit=None, alpha=None, range_vals=None):
     """
     Convenience wrapper to render a Teff-logg plot for a best-fit solution.
+
+    Matches IDL: interpolates a full evolutionary track at the exact
+    (mstar, feh) by trilinear interpolation over the MIST grid, then plots.
+
+    For multi-star systems, overlays each star's track on the same axes.
     """
-    mstar = bestfit['mstar']
-    feh = bestfit['feh']
-    age = bestfit['age']
-    teff = bestfit['teff']
-    rstar = bestfit['rstar']
+    from .ss import SS
+
+    nstars = bestfit.nstars if isinstance(bestfit, SS) else 1
+
+    if nstars == 1:
+        _plot_single_star_track(bestfit, '', outfile, vvcrit, alpha, range_vals)
+    else:
+        # Multi-star: overlay all tracks on a single plot
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        gravitysun = 27420.011
+        colors = ['blue', 'red', 'green', 'purple', 'orange']
+
+        for i in range(nstars):
+            suffix = f'_{i}'
+            mstar = bestfit[f'mstar{suffix}']
+            feh = bestfit[f'feh{suffix}']
+            age = bestfit[f'age{suffix}']
+            teff = bestfit[f'teff{suffix}']
+            rstar = bestfit[f'rstar{suffix}']
+            label = f'Star {chr(65+i)}'
+
+            if not (ALLOWED_MASS.min() <= mstar <= ALLOWED_MASS.max()):
+                continue
+            if not (ALLOWED_INITFEH.min() <= feh <= ALLOWED_INITFEH.max()):
+                continue
+
+            try:
+                teffs_iso, rstars_iso, ages_iso, eeps_iso = _interpolate_track_for_plot(
+                    mstar, feh, vvcrit=vvcrit, alpha=alpha
+                )
+            except (ValueError, IndexError):
+                continue
+
+            if len(teffs_iso) == 0:
+                continue
+
+            loggs_iso = np.log10(gravitysun * mstar / rstars_iso**2)
+
+            # Track line
+            color = colors[i % len(colors)]
+            ax.plot(teffs_iso, loggs_iso, '-', color=color, lw=1, label=f'{label} track')
+
+            # Best-fit point
+            logg_fit = np.log10(gravitysun * mstar / rstar**2)
+            ax.plot(teff, logg_fit, 'o', color=color, ms=8, mfc=color,
+                    label=f'{label} ({mstar:.2f} M$_\\odot$, {age:.1f} Gyr)')
+
+            # MIST model point at best-fit age
+            eep_idx = np.searchsorted(ages_iso, age)
+            eep_idx = np.clip(eep_idx, 1, len(ages_iso) - 1)
+            x = (age - ages_iso[eep_idx - 1]) / (ages_iso[eep_idx] - ages_iso[eep_idx - 1]) \
+                if ages_iso[eep_idx] != ages_iso[eep_idx - 1] else 0.0
+            mistteff = (1 - x) * teffs_iso[eep_idx - 1] + x * teffs_iso[eep_idx]
+            mistrstar = (1 - x) * rstars_iso[eep_idx - 1] + x * rstars_iso[eep_idx]
+            mistlogg = np.log10(gravitysun * mstar / mistrstar**2)
+            ax.plot(mistteff, mistlogg, 's', color=color, ms=6, mfc='none', mew=1.5)
+
+        ax.set_xlabel(r'$T_{\rm eff}$ (K)')
+        ax.set_ylabel(r'$\log g$ (cgs)')
+        ax.invert_xaxis()
+        ax.invert_yaxis()
+        ax.legend(fontsize=8, loc='best')
+
+        fig.savefig(outfile, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+
+
+def _plot_single_star_track(bestfit, suffix, outfile, vvcrit, alpha, range_vals):
+    """Plot MIST track for a single star (original logic)."""
+    mstar = bestfit[f'mstar{suffix}'] if suffix else bestfit['mstar']
+    feh = bestfit[f'feh{suffix}'] if suffix else bestfit['feh']
+    age = bestfit[f'age{suffix}'] if suffix else bestfit['age']
+    teff = bestfit[f'teff{suffix}'] if suffix else bestfit['teff']
+    rstar = bestfit[f'rstar{suffix}'] if suffix else bestfit['rstar']
+    gravitysun = 27420.011
 
     if not (ALLOWED_MASS.min() <= mstar <= ALLOWED_MASS.max()):
         return
@@ -359,28 +557,38 @@ def plot_mist_track(bestfit, outfile, vvcrit=None, alpha=None, range_vals=None):
         return
 
     try:
-        massndx = _mass_index(mstar)
-        fehndx = _feh_index(feh)
-        vvcritndx = 0 if vvcrit is None else _vvcrit_index(vvcrit)
-        alphandx = 0 if alpha is None else _alpha_index(alpha)
-    except ValueError:
+        teffs_iso, rstars_iso, ages_iso, eeps_iso = _interpolate_track_for_plot(
+            mstar, feh, vvcrit=vvcrit, alpha=alpha
+        )
+    except (ValueError, IndexError):
         return
 
-    ages, rstars, teffs, _, _ = _get_track_tuple_cached(massndx, fehndx, vvcritndx, alphandx)
-    eep = np.searchsorted(ages, age)
-    if eep == len(ages):
-        eep -= 1
+    if len(teffs_iso) == 0:
+        return
+
+    # Find the MIST model point at the best-fit EEP
+    eep = np.searchsorted(ages_iso, age)
+    eep = np.clip(eep, 1, len(ages_iso) - 1)
+    x = (age - ages_iso[eep - 1]) / (ages_iso[eep] - ages_iso[eep - 1]) \
+        if ages_iso[eep] != ages_iso[eep - 1] else 0.0
+    mistteff = (1 - x) * teffs_iso[eep - 1] + x * teffs_iso[eep]
+    mistrstar = (1 - x) * rstars_iso[eep - 1] + x * rstars_iso[eep]
+    eep_best = (1 - x) * eeps_iso[eep - 1] + x * eeps_iso[eep]
+
     _plot_mist_track(
-        teffs,
-        rstars,
-        ages,
+        teffs_iso,
+        rstars_iso,
+        ages_iso,
+        eeps_iso,
         mstar,
         feh,
         age,
         teff,
         rstar,
-        27420.011,
-        eep_index=eep,
+        gravitysun,
+        mistteff=mistteff,
+        mistrstar=mistrstar,
+        eep_best=eep_best,
         outfile=outfile,
         range_vals=range_vals,
     )

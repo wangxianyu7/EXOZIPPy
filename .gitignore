@@ -19,3 +19,11 @@ __pycache__/
 /examples/use_cases/test_output/
 CLAUDE.md
 exozippy/sed/nextgenfin/
+clearmacOSresource-forkfiles.sh
+Notebooks
+.claude
+fitresults/
+**/fitresults/
+._*
+*.h5
+*.npz

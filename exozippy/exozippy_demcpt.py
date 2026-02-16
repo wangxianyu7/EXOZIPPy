@@ -443,7 +443,7 @@ class DEMCPTSampler:
                         swap_s = ""
                         if ntemps > 1 and nswap_attempt > 0:
                             swap_s = f"; swap={nswap / nswap_attempt * 100:.1f}%"
-                        print(f"\n  Checkpoint saved at step {i + 1}.")
+                        # print(f"\n  Checkpoint saved at step {i + 1}.")
                         print(f"\r  {pct:5.1f}% | accept={acc:.1f}%{swap_s}   ",
                               end="", flush=True)
 
@@ -620,7 +620,7 @@ class DEMCPTSampler:
                         swap_s = ""
                         if ntemps > 1 and nswap_attempt > 0:
                             swap_s = f"; swap={nswap / nswap_attempt * 100:.1f}%"
-                        print(f"\n  Checkpoint saved at step {i + 1}.")
+                        # print(f"\n  Checkpoint saved at step {i + 1}.")
                         print(f"\r  {pct:5.1f}% | accept={acc:.1f}%{swap_s}   ",
                               end="", flush=True)
 

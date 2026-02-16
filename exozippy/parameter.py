@@ -163,10 +163,11 @@ class Parameter:
         if self.upper == None or self.lower==None or self.median == None:
             self.compute_confidence_interval()
 
+        scinote = getattr(self, 'scinote', '')
         if self.upper == self.lower:
-            self.latex_value = '$' + self.median + '\pm' + self.upper + '$'
+            self.latex_value = '$' + self.median + r'\pm' + self.upper + scinote + '$'
         else:
-            self.latex_value = '$' + self.median + '^{+' + self.upper + '}_{-' + self.lower + '}$'
+            self.latex_value = '$' + self.median + '^{+' + self.upper + '}_{-' + self.lower + '}' + scinote + '$'
 
     # format a line in a latex table
     # $symbol$ ... description (units) ... $value^{+upper}_{-lower}$\\
@@ -206,15 +207,59 @@ class Parameter:
         else:
             raise Exception("Cannot compute confidence interval without posteriors")
 
-    # rounds error to two sig figs, value to match
-    def round_for_display(self,sigfigs=2):
-        
-        nlower = -int(math.floor(math.log10(abs(self.lower_error)))) + (sigfigs-1)
-        nupper = -int(math.floor(math.log10(abs(self.upper_error)))) + (sigfigs-1)
+    # Port of EXOFASTv2 summarizepar.pro (lines 99-139).
+    # Rounds errors to 2 significant figures, value to match.
+    # Uses scientific notation when |exponent| > 4.
+    def round_for_display(self):
+        medvalue = self.median_value
+        upper = self.upper_error
+        lower = self.lower_error
 
-        if nlower < 0: n = min([nlower,nupper])
-        else: n = max([nlower,nupper])
+        # --- scientific notation decision (IDL lines 99-116) ---
+        expvalue = int(math.floor(math.log10(abs(medvalue)))) if medvalue != 0 else 0
+        exphi = int(math.floor(math.log10(upper))) if upper > 0 else 0
+        explo = int(math.floor(math.log10(lower))) if lower > 0 else 0
+        exps = [expvalue, exphi, explo]
 
-        self.median = str(round(self.median_value,n))
-        self.lower = str(round(self.lower_error,nlower))
-        self.upper = str(round(self.upper_error,nupper))
+        if medvalue < 1.0:
+            ndx = min(range(3), key=lambda i: abs(exps[i]))
+        else:
+            ndx = max(range(3), key=lambda i: abs(exps[i]))
+        exp = exps[ndx]
+
+        self.scinote = ''
+        if abs(exp) > 4 and (expvalue * exphi > 0) and (expvalue * explo > 0):
+            self.scinote = r' \times 10^{' + str(exp) + '}'
+            upper /= 10.0 ** exp
+            lower /= 10.0 ** exp
+            medvalue /= 10.0 ** exp
+
+        # --- round upper error to 2 sig figs (IDL lines 120-124) ---
+        exphi = int(math.floor(math.log10(upper))) if upper > 0 else 0
+        roundhi = round(upper / 10.0 ** (exphi - 1)) * 10.0 ** (exphi - 1)
+        if roundhi > 10:
+            self.upper = str(int(round(roundhi)))
+        else:
+            ndec_hi = 1 - exphi
+            self.upper = f"{roundhi:.{ndec_hi}f}"
+
+        # --- round lower error to 2 sig figs (IDL lines 127-131) ---
+        explo = int(math.floor(math.log10(lower))) if lower > 0 else 0
+        roundlo = round(lower / 10.0 ** (explo - 1)) * 10.0 ** (explo - 1)
+        if roundlo > 10:
+            self.lower = str(int(round(roundlo)))
+        else:
+            ndec_lo = 1 - explo
+            self.lower = f"{roundlo:.{ndec_lo}f}"
+
+        # --- round the value to the greater number of decimal places (IDL lines 134-139) ---
+        ndec = 1 - min(exphi, explo)
+        if ndec == 0:
+            self.median = str(int(round(medvalue)))
+        elif ndec < 0:
+            rounded = round(round(medvalue / 10.0 ** (-ndec)) * 10.0 ** (-ndec))
+            self.median = str(int(rounded))
+        else:
+            self.median = f"{medvalue:.{ndec}f}"
+        if self.median == '-0.0':
+            self.median = '0.0'

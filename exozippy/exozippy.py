@@ -12,6 +12,7 @@ Like EXOFASTv2, plots are generated at each stage:
 from pathlib import Path
 from datetime import datetime
 import argparse
+import glob as _glob
 import numpy as np
 
 from .fit_exoplanet import fit_exoplanet, run_mcmc, build_initial_guess, parse_priors
@@ -19,8 +20,10 @@ from .massradius_mist import plot_mist_track
 from .plottran import plottran
 from .plotrv import plotrv
 from .plotsed import plotsed
+from .plotmcmc import plot_corner, plot_trace
 from .derivepars import derivepars
 from .exozippy_latextab import summarize_samples, write_csv, exozippy_latextab
+from .mkprior2 import mkprior2
 
 
 def _log(msg, verbose=True):
@@ -46,15 +49,23 @@ def _make_plots(tranpath, rvpath, sedfile, bestfit, prefix_path,
     rv_png   = f'{pfx}rv.png'
     sed_png  = f'{pfx}sed.png'
 
-    plottran(str(tranpath), bestfit, samples=samples, e=e, omega=omega,
-             outfile=tran_png)
-    plotrv(str(rvpath), bestfit, samples=samples, e=e, omega=omega,
-           outfile=rv_png)
-    plotsed(str(sedfile), bestfit, outfile=sed_png)
+    # Expand glob patterns to actual file paths (pass all files to plotters)
+    tranfiles = sorted(_glob.glob(str(tranpath)))
+    rvfiles = sorted(_glob.glob(str(rvpath)))
+
+    if tranfiles:
+        plottran(tranfiles, bestfit, samples=samples, e=e, omega=omega,
+                 outfile=tran_png)
+    if rvfiles:
+        plotrv(rvfiles, bestfit, samples=samples, e=e, omega=omega,
+               outfile=rv_png)
+    if sedfile is not None:
+        plotsed(str(sedfile), bestfit, outfile=sed_png)
 
     _log(f'Transit plot: {tran_png}', verbose)
     _log(f'RV plot     : {rv_png}', verbose)
-    _log(f'SED plot    : {sed_png}', verbose)
+    if sedfile is not None:
+        _log(f'SED plot    : {sed_png}', verbose)
 
     if use_mist:
         mist_png = f'{pfx}mist.png'
@@ -78,6 +89,15 @@ def exozippy(
     mcmc_threads=None,
     mcmc_checkpoint=None,
     mcmc_checkpoint_every=100,
+    nstars=1,
+    fitjittervar=False,
+    fitvariance=False,
+    fitthermal=False,
+    fitreflect=False,
+    fitbeam=False,
+    fitellip=False,
+    fitttv=False,
+    novcve=False,
     verbose=True,
     **kwargs,
 ):
@@ -90,13 +110,12 @@ def exozippy(
         mistsed = kwargs.get('mistsedfile')
         fluxfile = kwargs.get('fluxfile')
         sedfile = mistsed or fluxfile
-    if sedfile is None:
-        raise ValueError("sedfile (or mistsedfile/fluxfile) must be provided")
 
     parfile = Path(parfile).expanduser().resolve()
     tranpath = Path(tranpath).expanduser().resolve()
     rvpath = Path(rvpath).expanduser().resolve()
-    sedfile = Path(sedfile).expanduser().resolve()
+    if sedfile is not None:
+        sedfile = Path(sedfile).expanduser().resolve()
 
     prefix_path = Path(prefix).expanduser()
     if prefix_path.is_dir() or str(prefix_path).endswith('/'):
@@ -111,19 +130,40 @@ def exozippy(
     _log(f'Prior file       : {parfile}', verbose)
     _log(f'Transit file     : {tranpath}', verbose)
     _log(f'RV file          : {rvpath}', verbose)
-    _log(f'SED file         : {sedfile}', verbose)
+    _log(f'SED file         : {sedfile or "(none)"}', verbose)
     _log(f'Output prefix    : {prefix_path}', verbose)
     _log(f'Circular orbit   : {circular}', verbose)
     _log(f'Use MIST         : {use_mist}', verbose)
 
-    e = 0.0 if circular else 0.0  # placeholder until eccentric support added
-    omega = np.pi / 2
+    # Initial e/omega from priors (when non-circular, sesinw/secosw handle it internally)
+    priors_parsed = parse_priors(str(parfile))
+    if circular:
+        e = 0.0
+        omega = np.pi / 2
+    else:
+        e = priors_parsed.get('e', {}).get('value', 0.0)
+        omega = priors_parsed.get('omega', {}).get('value', np.pi / 2)
+
+    # Auto-detect vcve mode: transit-only + non-circular + not suppressed
+    import glob as _gl
+    _has_rv = bool(sorted(_gl.glob(str(rvpath))))
+    usevcve = (not circular) and (not _has_rv) and (not novcve)
+    if usevcve:
+        _log('Using Vc/Ve eccentricity parameterization (transit-only)', verbose)
+
+    pc_kwargs = dict(fitjittervar=fitjittervar, fitvariance=fitvariance,
+                     fitttv=fitttv,
+                     fitthermal=fitthermal, fitreflect=fitreflect,
+                     fitbeam=fitbeam, fitellip=fitellip,
+                     usevcve=usevcve)
 
     # --- Stage 1: start (initial guess plots) ---
     _log_section('Start Plots', verbose)
     init_guess = build_initial_guess(
         str(parfile), str(tranpath), str(rvpath),
-        e=e, omega=omega, use_mist=use_mist,
+        e=e, omega=omega, circular=circular,
+        use_mist=use_mist, nstars=nstars,
+        **pc_kwargs,
     )
     _make_plots(tranpath, rvpath, sedfile, init_guess, prefix_path,
                 e, omega, use_mist, verbose, tag='start')
@@ -134,8 +174,11 @@ def exozippy(
         bestfit = init_guess
     else:
         bestfit = fit_exoplanet(
-            str(parfile), str(tranpath), str(rvpath), str(sedfile),
-            e=e, omega=omega, verbose=verbose, use_mist=use_mist,
+            str(parfile), str(tranpath), str(rvpath),
+            str(sedfile) if sedfile is not None else None,
+            e=e, omega=omega, circular=circular,
+            verbose=verbose, use_mist=use_mist,
+            nstars=nstars, **pc_kwargs,
         )
 
         _log_section('Amoeba Plots', verbose)
@@ -153,12 +196,14 @@ def exozippy(
             mcmc_checkpoint = f'{prefix_path}mcmc.h5'
         if mcmc_checkpoint_every and mcmc_checkpoint_every > 0:
             _log(f'Checkpoint: {mcmc_checkpoint} (every {mcmc_checkpoint_every} steps)', verbose)
-        samples, labels, summary, bestfit_mcmc = run_mcmc(
-            str(parfile), str(tranpath), str(rvpath), str(sedfile),
-            bestfit=bestfit, e=e, omega=omega,
+        samples, labels, summary, bestfit_mcmc, chain_info = run_mcmc(
+            str(parfile), str(tranpath), str(rvpath),
+            str(sedfile) if sedfile is not None else None,
+            bestfit=bestfit, e=e, omega=omega, circular=circular,
             nchains=mcmc_nchains, nsteps=mcmc_steps, ntemps=mcmc_ntemps,
             verbose=verbose, use_mist=use_mist, nthreads=mcmc_threads,
             checkpoint=mcmc_checkpoint, checkpoint_every=mcmc_checkpoint_every,
+            nstars=nstars, **pc_kwargs,
         )
         _log_section('MCMC Plots', verbose)
         if bestfit_mcmc is None:
@@ -167,6 +212,20 @@ def exozippy(
         _make_plots(tranpath, rvpath, sedfile, bestfit_mcmc, prefix_path,
                     e, omega, use_mist, verbose, tag='mcmc',
                     samples=samples)
+
+        # Corner plot and trace plot (arviz)
+        corner_png = f'{prefix_path}mcmc.corner.png'
+        trace_png = f'{prefix_path}mcmc.trace.png'
+        try:
+            plot_corner(chain_info, outfile=corner_png)
+            _log(f'Corner plot : {corner_png}', verbose)
+        except Exception as exc:
+            _log(f'Corner plot failed: {exc}', verbose)
+        try:
+            plot_trace(chain_info, outfile=trace_png)
+            _log(f'Trace plot  : {trace_png}', verbose)
+        except Exception as exc:
+            _log(f'Trace plot failed: {exc}', verbose)
 
         # Derived parameter tables (CSV + LaTeX)
         priors = parse_priors(str(parfile))
@@ -180,6 +239,15 @@ def exozippy(
         exozippy_latextab(summary_d, tex_path, caption=caption, label=label)
         _log(f"Saved table: {tex_path}", verbose)
         _log(f"Saved table: {csv_path}", verbose)
+
+    # --- Write updated prior file with best-fit starting values ---
+    final_ss = bestfit
+    if run_mcmc_flag and samples is not None and bestfit_mcmc is not None:
+        final_ss = bestfit_mcmc
+    try:
+        mkprior2(str(parfile), final_ss, verbose=verbose)
+    except Exception as exc:
+        _log(f'Updated priors failed: {exc}', verbose)
 
     end_time = datetime.utcnow()
     _log_section('Done', verbose)
@@ -205,6 +273,8 @@ def _cli():
     parser.add_argument('--workers', type=int, default=None, help='Processes for parallel MCMC')
     parser.add_argument('--checkpoint', type=str, default=None, help='HDF5 checkpoint path (default: <prefix>mcmc.h5)')
     parser.add_argument('--checkpoint-every', type=int, default=100, help='Checkpoint interval in steps (default: 100)')
+    parser.add_argument('--ttv', action='store_true', help='Fit transit timing variations (requires >=3 transits)')
+    parser.add_argument('--novcve', action='store_true', help='Disable Vc/Ve eccentricity parameterization')
     parser.add_argument('--quiet', action='store_true', help='Reduce console output')
     args = parser.parse_args()
 
@@ -216,6 +286,8 @@ def _cli():
         prefix=args.prefix,
         circular=not args.noncircular,
         nomist=args.nomist,
+        fitttv=args.ttv,
+        novcve=args.novcve,
         skipopt=args.skipopt,
         run_mcmc_flag=args.mcmc,
         mcmc_steps=args.steps,

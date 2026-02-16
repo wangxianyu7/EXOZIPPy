@@ -1,0 +1,54 @@
+# Stellar parameters
+rstar 1.6456
+teff 7459
+feh 0.25 0.08
+# SED parameters
+parallax 4.4688 0.0582
+av 0 -1 0 0.11687
+# TRES
+gamma_0 115.94
+jittervar_0 8764.30
+# TRESRM
+gamma_1 0.0
+jittervar_1 10000.0
+# Planet b
+tc_0 2457287.74511
+logp_0 0.48857
+p_0 0.0936
+cosi_0 0.0827
+# CROW UT 2015-03-05 (I)
+variance_0 0.0000014
+f0_0 0.9998
+# KUO UT 2015-03-12 (I)
+variance_1 0.0000014
+f0_1 1.0000
+# Whitin UT 2015-03-12 (g')
+variance_2 0.0000035
+f0_2 0.9982
+# Whitin UT 2015-03-12 (i')
+variance_3 0.0000027
+f0_3 0.9996
+# Pvdk UT 2015-03-12 (z')
+variance_4 0.0000012
+f0_4 0.9995
+# KUO UT 2015-03-12 (V)
+variance_5 0.0000023
+f0_5 1.0005
+# WCO UT 2015-11-04 (z')
+variance_6 0.0
+f0_6 0.9993
+# MVRC UT 2016-02-26 (g')
+variance_7 0.0000032
+f0_7 0.9990
+# MVRC UT 2016-02-26 (i')
+variance_8 0.0000012
+f0_8 0.9999
+# PEST UT 2016-03-06 (B)
+variance_9 0.0000093
+f0_9 1.0022
+# ZRO UT 2016-03-12 (I)
+variance_10 0.0000065
+f0_10 0.9998
+# MVRC UT 2016-03-31 (r')
+variance_11 0.0000025
+f0_11 1.0001

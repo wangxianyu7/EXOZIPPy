@@ -2,9 +2,13 @@
 Joint SED + Transit + RV fitting for EXOZIPPy.
 
 Simultaneously fits stellar parameters (Teff, Rstar, [Fe/H], Av, distance)
-and planetary parameters (tc, period, p, cosi, u1, u2, f0, K, gamma) to
-broadband photometry, transit light curve, and radial velocity data.
+and planetary parameters (tc, period, p, cosi, K) plus per-band limb darkening
+(u1, u2), per-transit normalization (f0), and per-telescope gamma to
+broadband photometry, transit light curves, and radial velocity data.
+
+Supports multiple transit light curves and multiple RV telescopes.
 """
+import glob as _glob
 import numpy as np
 import os
 from scipy.optimize import minimize
@@ -16,26 +20,42 @@ from exozippy.exozippy_demcpt import DEMCPTSampler
 from exozippy.exozippy_chi2 import (
     joint_chi2,
     param_names as _param_names,
+    param_scales as _param_scales,
     derive_logg as _derive_logg,
     derive_lstar as _derive_lstar,
     derive_ar as _derive_ar,
     BASE_PARAM_NAMES, BASE_SCALES,
 )
+from exozippy.mkss import mkss, _parse_priors
+from exozippy.ss import SS
 
 # Keep backward-compatible alias
 joint_negloglike = joint_chi2
 
 
-def _mcmc_log_posterior(theta, tran_data, rv_data, sedfile, priors, sed_data,
-                        e, omega, rv_jittervar, tran_addvar, use_mist,
-                        mstar_fixed, age_prior):
+def _mcmc_log_posterior(theta, tran_data_list, rv_data_list, sedfile, priors,
+                        sed_data, e, omega, rv_jittervar_list, tran_addvar_list,
+                        use_mist, mstar_fixed, age_prior, nstars=1,
+                        ntran=1, ntel=1, nbands=1,
+                        circular=True, usevcve=False,
+                        fitjittervar=False, fitvariance=False,
+                        fitttv=False, epoch_list=None,
+                        fitthermal=False, fitreflect=False,
+                        fitbeam=False, fitellip=False):
     """Module-level log-posterior for picklability with multiprocessing."""
-    chi2 = joint_chi2(theta, tran_data, rv_data, sedfile, priors,
+    chi2 = joint_chi2(theta, tran_data_list, rv_data_list, sedfile, priors,
                       sed_data=sed_data,
                       e=e, omega=omega,
-                      rv_jittervar=rv_jittervar, tran_addvar=tran_addvar,
+                      rv_jittervar_list=rv_jittervar_list,
+                      tran_addvar_list=tran_addvar_list,
                       use_mist=use_mist, mstar_fixed=mstar_fixed,
-                      age_prior=age_prior)
+                      age_prior=age_prior, nstars=nstars,
+                      ntran=ntran, ntel=ntel, nbands=nbands,
+                      circular=circular, usevcve=usevcve,
+                      fitjittervar=fitjittervar, fitvariance=fitvariance,
+                      fitttv=fitttv, epoch_list=epoch_list,
+                      fitthermal=fitthermal, fitreflect=fitreflect,
+                      fitbeam=fitbeam, fitellip=fitellip)
     if not np.isfinite(chi2) or chi2 > 1e9:
         return -np.inf
     return -0.5 * chi2
@@ -53,38 +73,22 @@ def _log_section(title: str, verbose: bool):
 
 
 def parse_priors(priorfile):
-    """
-    Parse an EXOFASTv2-style prior file.
+    """Parse an EXOFASTv2-style prior file."""
+    return _parse_priors(priorfile)
 
-    Returns
-    -------
-    priors : dict
-        Keys are parameter names; values are dicts with fields:
-        'value', 'sigma' (0 if none), 'lower', 'upper' (NaN if none).
-    """
-    priors = {}
-    with open(priorfile) as f:
-        for line in f:
-            line = line.split('#')[0].strip()
-            if not line:
-                continue
-            parts = line.split()
-            name = parts[0]
-            vals = [float(x) for x in parts[1:]]
-            entry = {'value': vals[0], 'sigma': 0.0,
-                     'lower': np.nan, 'upper': np.nan}
-            if len(vals) >= 2:
-                entry['sigma'] = vals[1]
-            if len(vals) >= 3:
-                entry['lower'] = vals[2]
-            if len(vals) >= 4:
-                entry['upper'] = vals[3]
-            priors[name] = entry
-    return priors
+
+def _resolve_glob(pattern):
+    """Expand a glob pattern to the first matching file, or return as-is."""
+    if '*' in str(pattern) or '?' in str(pattern):
+        matches = sorted(_glob.glob(str(pattern)))
+        if matches:
+            return matches[0]
+    return str(pattern)
 
 
 def read_transit_data(tranfile):
     """Read a transit light curve file (BJD flux err)."""
+    tranfile = _resolve_glob(tranfile)
     data = np.loadtxt(tranfile, comments='#')
     return {
         'bjd': data[:, 0],
@@ -95,6 +99,7 @@ def read_transit_data(tranfile):
 
 def read_rv_data(rvfile):
     """Read an RV data file (BJD vel err_vel)."""
+    rvfile = _resolve_glob(rvfile)
     data = np.loadtxt(rvfile, comments='#')
     return {
         'bjd': data[:, 0],
@@ -103,109 +108,102 @@ def read_rv_data(rvfile):
     }
 
 
+def read_all_transit_data(tranpath):
+    """Read all transit files matching a glob pattern.
+
+    Returns (list[dict], list[str]) — data dicts and file paths.
+    """
+    files = sorted(_glob.glob(str(tranpath)))
+    return [read_transit_data(f) for f in files], files
+
+
+def read_all_rv_data(rvpath):
+    """Read all RV files matching a glob pattern.
+
+    Returns (list[dict], list[str]) — data dicts and file paths.
+    """
+    files = sorted(_glob.glob(str(rvpath)))
+    return [read_rv_data(f) for f in files], files
+
+
 def build_initial_guess(priorfile, tranfile, rvfile, e=0.0,
-                        omega=np.pi/2, use_mist=False):
+                        omega=np.pi/2, circular=True, usevcve=False,
+                        use_mist=False, nstars=1,
+                        fitjittervar=False, fitvariance=False,
+                        fitttv=False,
+                        fitthermal=False, fitreflect=False,
+                        fitbeam=False, fitellip=False):
     """
-    Construct a bestfit-like dict from priors (before optimization).
-
-    Returns the same dict structure as fit_exoplanet so it can be
-    passed directly to plottran / plotrv / plotsed.
+    Construct an SS object from priors (before optimization).
     """
-    priors = parse_priors(priorfile)
-    tran_data = read_transit_data(tranfile)
-    mstar = priors.get('mstar', {}).get('value', 1.0)
-    age = priors.get('age', {}).get('value', 1.0)
+    ss = mkss(
+        parfile=priorfile,
+        tranpath=tranfile,
+        rvpath=rvfile,
+        use_mist=use_mist,
+        nstars=nstars,
+        circular=circular,
+        usevcve=usevcve,
+        fitjittervar=fitjittervar, fitvariance=fitvariance,
+        fitttv=fitttv,
+        fitthermal=fitthermal, fitreflect=fitreflect,
+        fitbeam=fitbeam, fitellip=fitellip,
+    )
+    ss.planet[0].e.value = e
+    ss.planet[0].omega.value = omega
+    # Initialize sesinw/secosw from e/omega
+    sqrte = np.sqrt(e)
+    ss.planet[0].sesinw.value = sqrte * np.sin(omega)
+    ss.planet[0].secosw.value = sqrte * np.cos(omega)
 
-    teff = priors.get('teff', {}).get('value', 5500.0)
-    rstar = priors.get('rstar', {}).get('value', 1.0)
-    feh = priors.get('feh', {}).get('value', 0.0)
-    av = 0.01
+    priors = _parse_priors(priorfile)
+    if 'tc' not in priors:
+        tran_data_list, _ = read_all_transit_data(tranfile)
+        if tran_data_list:
+            all_bjd = np.concatenate([td['bjd'] for td in tran_data_list])
+            ss.planet[0].tc.value = float(np.median(all_bjd))
+
     if 'parallax' in priors:
-        distance = 1000.0 / priors['parallax']['value']
+        ss.star[0].distance.value = 1000.0 / priors['parallax']['value']
+
+    ss.compute_derived()
+    return ss
+
+
+def _update_ss_from_params(ss, params, param_names, e=0.0, omega=np.pi/2):
+    """Update an SS object from a flat parameter vector."""
+    ss.from_vector(params, param_names)
+    # Derive e/omega from eccentricity parameterization
+    if 'vcve' in param_names:
+        # vcve parameterization — compute_derived handles it via ss.py
+        pass
+    elif 'sesinw' in param_names:
+        sesinw = ss['sesinw']
+        secosw = ss['secosw']
+        ss.planet[0].e.value = sesinw**2 + secosw**2
+        ss.planet[0].omega.value = np.arctan2(sesinw, secosw)
     else:
-        distance = 135.0
-    tc = priors.get('tc', {}).get('value', np.median(tran_data['bjd']))
-    period = priors.get('period_0', {}).get('value', 3.0)
-    p = priors.get('p', {}).get('value', 0.1)
-    cosi = priors.get('cosi', {}).get('value', 0.05)
-    u1 = 0.4
-    u2 = 0.2
-    f0 = priors.get('f0', {}).get('value', np.median(tran_data['flux']))
-    K = priors.get('k_0', {}).get('value', 50.0)
-    gamma = priors.get('gamma_0', {}).get('value', 0.0)
-
-    logg = _derive_logg(mstar, rstar)
-    lstar = _derive_lstar(teff, rstar)
-    ar = _derive_ar(period, mstar, rstar)
-    inc = np.arccos(cosi)
-
-    return {
-        'teff': teff, 'rstar': rstar, 'feh': feh,
-        'av': av, 'distance': distance,
-        'tc': tc, 'period': period, 'p': p, 'cosi': cosi,
-        'u1': u1, 'u2': u2, 'f0': f0,
-        'K': K, 'gamma': gamma,
-        'logg': logg, 'lstar': lstar, 'ar': ar,
-        'inc_rad': inc, 'ideg': np.degrees(inc),
-        'b': ar * cosi, 'delta': p**2,
-        'parallax': 1000.0 / distance, 'mstar': mstar,
-        'age': age, 'e': e, 'omega': omega,
-        'param_names': _param_names(use_mist), 'use_mist': use_mist,
-    }
-
-
-def _bestfit_from_params(params, param_names, e, omega, mstar_prior, age_prior,
-                         use_mist):
-    """Build a bestfit-like dict from a parameter vector."""
-    d = {name: params[i] for i, name in enumerate(param_names)}
-
-    mstar = d.get('mstar', mstar_prior)
-    age = d.get('age', age_prior)
-
-    teff = d['teff']
-    rstar = d['rstar']
-    feh = d['feh']
-    av = d['av']
-    distance = d['distance']
-    tc = d['tc']
-    period = d['period']
-    p = d['p']
-    cosi = d['cosi']
-    u1 = d['u1']
-    u2 = d['u2']
-    f0 = d['f0']
-    K = d['K']
-    gamma = d['gamma']
-
-    logg = _derive_logg(mstar, rstar)
-    lstar = _derive_lstar(teff, rstar)
-    ar = _derive_ar(period, mstar, rstar)
-    inc = np.arccos(cosi)
-
-    return {
-        'teff': teff, 'rstar': rstar, 'feh': feh,
-        'av': av, 'distance': distance,
-        'tc': tc, 'period': period, 'p': p, 'cosi': cosi,
-        'u1': u1, 'u2': u2, 'f0': f0,
-        'K': K, 'gamma': gamma,
-        'logg': logg, 'lstar': lstar, 'ar': ar,
-        'inc_rad': inc, 'ideg': np.degrees(inc),
-        'b': ar * cosi, 'delta': p**2,
-        'parallax': 1000.0 / distance, 'mstar': mstar,
-        'age': age, 'e': e, 'omega': omega,
-        'param_names': list(param_names), 'use_mist': use_mist,
-    }
+        ss.planet[0].e.value = e
+        ss.planet[0].omega.value = omega
+    return ss
 
 
 def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
-                  omega=np.pi/2, verbose=True, use_mist=False):
+                  omega=np.pi/2, circular=True, usevcve=False,
+                  verbose=True, use_mist=False, nstars=1,
+                  fitjittervar=False, fitvariance=False,
+                  fitttv=False,
+                  fitthermal=False, fitreflect=False,
+                  fitbeam=False, fitellip=False):
     """
     Joint fit of SED (+ optional MIST evolutionary prior) + Transit + RV data.
 
+    Supports multiple transit light curves and multiple RV telescopes.
+
     Returns
     -------
-    result : dict
-        Best-fit parameters, chi2, derived quantities.
+    result : SS
+        Best-fit stellar system with parameter values, chi2, derived quantities.
     """
     start_time = datetime.utcnow()
     _log_section('Joint SED + Transit + RV Fit', verbose)
@@ -213,73 +211,111 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
     _log(f'Prior file       : {priorfile}', verbose)
     _log(f'Transit file     : {tranfile}', verbose)
     _log(f'RV file          : {rvfile}', verbose)
-    _log(f'SED file         : {sedfile}', verbose)
+    _log(f'SED file         : {sedfile or "(none)"}', verbose)
     _log(f'Orbital params   : e={e}, omega={omega:.4f}', verbose)
     _log(f'Use MIST         : {use_mist}', verbose)
 
     from exozippy.sed.utils import read_sed_file
 
     priors = parse_priors(priorfile)
-    tran_data = read_transit_data(tranfile)
-    rv_data = read_rv_data(rvfile)
-    sed_data = read_sed_file(sedfile, 1) if sedfile is not None else None
+    tran_data_list, tranfiles = read_all_transit_data(tranfile)
+    rv_data_list, rvfiles = read_all_rv_data(rvfile)
+    has_sed = sedfile is not None
+    sed_data = read_sed_file(sedfile, nstars) if has_sed else None
     mstar_prior = priors.get('mstar', {}).get('value', 1.0)
     age_prior = priors.get('age', {}).get('value', 1.0)
-    param_names = _param_names(use_mist)
 
-    # Fixed jitter/variance from priors
-    rv_jittervar = priors.get('jittervar', {}).get('value', 0.0)
-    tran_addvar = priors.get('variance', {}).get('value', 0.0)
+    ntran = len(tran_data_list)
+    ntel = len(rv_data_list)
+    nbands = 1  # for now, single band
 
-    # Starting values
-    teff0 = priors.get('teff', {}).get('value', 5500.0)
-    rstar0 = priors.get('rstar', {}).get('value', 1.0)
-    feh0 = priors.get('feh', {}).get('value', 0.0)
-    av0 = 0.01
+    # Compute epoch list for TTV (needs tc/period from priors)
+    _fitttv = fitttv and ntran >= 3
+    epoch_list = None
+    if _fitttv:
+        tc_prior = priors.get('tc', {}).get('value', None)
+        period_prior = priors.get('period_0', priors.get('period', {})).get('value', 3.0) if isinstance(priors.get('period_0', priors.get('period', {})), dict) else 3.0
+        if tc_prior is not None and period_prior > 0:
+            epoch_list = [int(round((float(np.median(td['bjd'])) - tc_prior) / period_prior))
+                          for td in tran_data_list]
+        else:
+            _fitttv = False  # can't compute epochs without tc/period
+
+    pnames = _param_names(use_mist, nstars=nstars, has_sed=has_sed,
+                          ntran=ntran, ntel=ntel, nbands=nbands,
+                          circular=circular, usevcve=usevcve,
+                          fitjittervar=fitjittervar, fitvariance=fitvariance,
+                          fitttv=_fitttv,
+                          fitthermal=fitthermal, fitreflect=fitreflect,
+                          fitbeam=fitbeam, fitellip=fitellip)
+
+    # Per-instrument jittervar/variance from priors
+    rv_jittervar_list = [priors.get(f'jittervar_{j}', {}).get('value', 0.0)
+                         for j in range(ntel)]
+    tran_addvar_list = [priors.get(f'variance_{j}', {}).get('value', 0.0)
+                        for j in range(ntran)]
+
+    # Build SS for initial values
+    ss = mkss(
+        parfile=priorfile,
+        tranpath=tranfile,
+        rvpath=rvfile,
+        sedfile=sedfile,
+        use_mist=use_mist,
+        nstars=nstars,
+        circular=circular,
+        usevcve=usevcve,
+        fitttv=_fitttv,
+        fitthermal=fitthermal, fitreflect=fitreflect,
+        fitbeam=fitbeam, fitellip=fitellip,
+    )
+    ss.planet[0].e.value = e
+    ss.planet[0].omega.value = omega
+    sqrte = np.sqrt(e)
+    ss.planet[0].sesinw.value = sqrte * np.sin(omega)
+    ss.planet[0].secosw.value = sqrte * np.cos(omega)
+
     if 'parallax' in priors:
-        dist0 = 1000.0 / priors['parallax']['value']
-    else:
-        dist0 = 135.0
-    tc0 = priors.get('tc', {}).get('value', np.median(tran_data['bjd']))
-    period0 = priors.get('period_0', {}).get('value', 3.0)
-    p0 = priors.get('p', {}).get('value', 0.1)
-    cosi0 = priors.get('cosi', {}).get('value', 0.05)
-    u1_0 = 0.4
-    u2_0 = 0.2
-    f0_0 = priors.get('f0', {}).get('value', np.median(tran_data['flux']))
-    K0 = priors.get('k_0', {}).get('value', 50.0)
-    gamma0 = priors.get('gamma_0', {}).get('value', 0.0)
+        ss.star[0].distance.value = 1000.0 / priors['parallax']['value']
+    if 'tc' not in priors and tran_data_list:
+        all_bjd = np.concatenate([td['bjd'] for td in tran_data_list])
+        ss.planet[0].tc.value = float(np.median(all_bjd))
 
-    x0_list = []
-    if use_mist:
-        x0_list.extend([mstar_prior, max(age_prior, 0.5)])
-    x0_list.extend([
-        teff0, rstar0, feh0, av0, dist0,
-        tc0, period0, p0, cosi0,
-        u1_0, u2_0, f0_0,
-        K0, gamma0
-    ])
-    x0 = np.array(x0_list)
+    ss.compute_derived()
+    x0 = ss.to_vector(pnames)
 
     if verbose:
         if use_mist:
-            _log(f"Initial mstar/age: {mstar_prior:.3f} Msun, {age_prior:.2f} Gyr", verbose)
+            _log(f"Initial mstar/age: {ss['mstar']:.3f} Msun, {ss['age']:.2f} Gyr", verbose)
         else:
             _log(f"Fixed mstar = {mstar_prior:.3f} Msun", verbose)
-        _log(f"Transit data     : {len(tran_data['bjd'])} points", verbose)
-        _log(f"RV data          : {len(rv_data['bjd'])} points", verbose)
+        for j, tf in enumerate(tranfiles):
+            _log(f"Transit {j}       : {os.path.basename(tf)} ({len(tran_data_list[j]['bjd'])} pts)", verbose)
+        for j, rf in enumerate(rvfiles):
+            _log(f"Telescope {j}     : {os.path.basename(rf)} ({len(rv_data_list[j]['bjd'])} pts)", verbose)
         _log("Starting parameters:", verbose)
-        _log(f"  Teff={teff0:.0f}K  Rstar={rstar0:.3f}  [Fe/H]={feh0:.3f}  Av={av0:.3f}  dist={dist0:.1f}", verbose)
-        _log(f"  tc={tc0:.5f}  P={period0:.6f}  p={p0:.4f}  cosi={cosi0:.4f}", verbose)
-        _log(f"  u1={u1_0:.2f}  u2={u2_0:.2f}  f0={f0_0:.5f}", verbose)
-        _log(f"  K={K0:.1f}  gamma={gamma0:.1f}", verbose)
-        chi2_init = joint_negloglike(
-            x0, tran_data, rv_data, sedfile, priors,
-            e, omega, rv_jittervar, tran_addvar,
+        _log(f"  Teff={ss['teff']:.0f}K  Rstar={ss['rstar']:.3f}  [Fe/H]={ss['feh']:.3f}  Av={ss['av']:.3f}  dist={ss['distance']:.1f}", verbose)
+        _log(f"  tc={ss['tc']:.5f}  P={ss['period']:.6f}  p={ss['p']:.4f}  cosi={ss['cosi']:.4f}", verbose)
+        _log(f"  u1_0={ss['u1_0']:.2f}  u2_0={ss['u2_0']:.2f}", verbose)
+        for j in range(ntran):
+            _log(f"  f0_{j}={ss[f'f0_{j}']:.5f}", verbose)
+        _log(f"  K={ss['K']:.1f}", verbose)
+        for j in range(ntel):
+            _log(f"  gamma_{j}={ss[f'gamma_{j}']:.1f}", verbose)
+        chi2_init = joint_chi2(
+            x0, tran_data_list, rv_data_list, sedfile, priors,
+            e, omega, rv_jittervar_list=rv_jittervar_list,
+            tran_addvar_list=tran_addvar_list,
             use_mist=use_mist,
             mstar_fixed=mstar_prior,
             age_prior=age_prior,
-            sed_data=sed_data)
+            sed_data=sed_data, nstars=nstars,
+            ntran=ntran, ntel=ntel, nbands=nbands,
+            circular=circular, usevcve=usevcve,
+            fitjittervar=fitjittervar, fitvariance=fitvariance,
+            fitttv=_fitttv, epoch_list=epoch_list,
+            fitthermal=fitthermal, fitreflect=fitreflect,
+            fitbeam=fitbeam, fitellip=fitellip)
         _log(f"Initial chi2     : {chi2_init:.2f}", verbose)
 
     # Av upper bound
@@ -288,19 +324,34 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
         av_upper = 1.0
 
     # Phase 1: Nelder-Mead
-    scale_vec = BASE_SCALES.copy()
-    if use_mist:
-        scale_vec = np.concatenate(([0.05, 0.5], scale_vec))
+    ar_init = ss['ar'] if ss['ar'] > 0 else 10.0
+    scale_vec = _param_scales(use_mist, nstars=nstars, has_sed=has_sed,
+                              ntran=ntran, ntel=ntel, nbands=nbands,
+                              circular=circular, usevcve=usevcve, ar_init=ar_init,
+                              fitjittervar=fitjittervar, fitvariance=fitvariance,
+                              fitttv=_fitttv,
+                              fitthermal=fitthermal, fitreflect=fitreflect,
+                              fitbeam=fitbeam, fitellip=fitellip)
+
+    def _chi2_func(params):
+        return joint_chi2(
+            params, tran_data_list, rv_data_list, sedfile, priors,
+            e, omega, rv_jittervar_list=rv_jittervar_list,
+            tran_addvar_list=tran_addvar_list,
+            use_mist=use_mist, mstar_fixed=mstar_prior,
+            age_prior=age_prior,
+            sed_data=sed_data, nstars=nstars,
+            ntran=ntran, ntel=ntel, nbands=nbands,
+            circular=circular, usevcve=usevcve,
+            fitjittervar=fitjittervar, fitvariance=fitvariance,
+            fitttv=_fitttv, epoch_list=epoch_list,
+            fitthermal=fitthermal, fitreflect=fitreflect,
+            fitbeam=fitbeam, fitellip=fitellip)
 
     if verbose:
         _log('Starting Amoeba (Nelder-Mead) search...', verbose)
     amoeba_sol, amoeba_chi2, amoeba_info = amoeba(
-        lambda params: joint_negloglike(
-            params, tran_data, rv_data, sedfile, priors,
-            e, omega, rv_jittervar, tran_addvar,
-            use_mist, mstar_prior, age_prior,
-            sed_data=sed_data),
-        x0=x0, scale=scale_vec,
+        _chi2_func, x0=x0, scale=scale_vec,
         ftol=1e-6, maxiter=50000, verbose=verbose)
     if verbose:
         if amoeba_info['success']:
@@ -309,188 +360,274 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
             _log('Amoeba reached max iterations; proceeding to L-BFGS-B.', verbose)
 
     # Phase 2: L-BFGS-B with bounds
+    tc0 = ss['tc']
+    period0 = ss['period']
     bounds = []
-    if use_mist:
+    # Per-star bounds
+    for i in range(nstars):
+        if use_mist:
+            bounds.extend([
+                (-1.0, 0.7),        # logmstar (0.1 to 5 Msun)
+                (0.01, 14.0),       # age (Gyr)
+            ])
         bounds.extend([
-            (0.1, 2.0),         # mstar
-            (0.01, 14.0),       # age (Gyr)
+            (3000, 10000),          # teff
+            (0.1, 10.0),            # rstar
+            (-2.0, 0.75),           # feh
         ])
+        if has_sed:
+            bounds.extend([
+                (0.0, av_upper),        # av
+                (1.0, 10000.0),         # distance
+            ])
+    # Shared orbital bounds
+    K0 = ss['K']
+    logP0 = np.log10(period0)
     bounds.extend([
-        (3000, 10000),          # teff
-        (0.1, 10.0),            # rstar
-        (-2.0, 0.75),           # feh
-        (0.0, av_upper),        # av
-        (1.0, 10000.0),         # distance
-        (tc0 - 0.5, tc0 + 0.5), # tc
-        (period0 * 0.99, period0 * 1.01),  # period
-        (0.001, 0.5),           # p
-        (0.0, 0.99),            # cosi
-        (0.0, 2.0),             # u1
-        (-1.0, 1.0),            # u2
-        (0.5, 1.5),             # f0
-        (0.1, 500.0),           # K
-        (-1000.0, 1000.0),      # gamma
+        (tc0 - 0.5, tc0 + 0.5),             # tc
+        (logP0 - 0.005, logP0 + 0.005),     # logP (±1.2% in period)
+        (-0.5, 0.5),                         # p (negative allowed per EXOFASTv2)
+        (0.0, 0.99),                         # cosi
+        (0.1, max(K0 * 5, 500.0)),           # K
     ])
+    # Eccentricity bounds (when non-circular)
+    if not circular:
+        if usevcve:
+            bounds.extend([
+                (1e-6, 1.0),                        # vcve (0, 1]
+                (-1.0, 1.0),                        # lsinw
+                (-1.0, 1.0),                        # lcosw
+                (-1.0, 2.0),                        # sign
+            ])
+        else:
+            bounds.extend([
+                (-1.0, 1.0),                        # sesinw
+                (-1.0, 1.0),                        # secosw
+            ])
+    # Per-band LD bounds
+    for j in range(nbands):
+        bounds.extend([
+            (0.0, 2.0),             # u1
+            (-1.0, 1.0),            # u2
+        ])
+    # Per-band phase curve bounds (ppm)
+    if fitthermal:
+        for j in range(nbands):
+            bounds.append((0.0, 5000.0))       # thermal >= 0
+    if fitreflect:
+        for j in range(nbands):
+            bounds.append((0.0, 5000.0))       # reflect >= 0
+    # Per-transit f0 bounds
+    for j in range(ntran):
+        bounds.append((0.5, 1.5))
+    # Per-transit variance bounds (allow negative per EXOFASTv2)
+    if fitvariance:
+        for j in range(ntran):
+            max_flux_err = max(td['err'].max() for td in tran_data_list) if tran_data_list else 0.01
+            bounds.append((-max_flux_err**2, 10 * max_flux_err**2))
+    # Per-transit TTV bounds: |ttv| < period/2
+    if _fitttv:
+        half_period = period0 / 2.0
+        for j in range(ntran):
+            bounds.append((-half_period, half_period))
+    # Per-telescope gamma bounds
+    for j in range(ntel):
+        gamma_j = ss[f'gamma_{j}']
+        bounds.append((gamma_j - 5000.0, gamma_j + 5000.0))
+    # Per-telescope jittervar bounds (allow negative per EXOFASTv2)
+    if fitjittervar:
+        for j in range(ntel):
+            max_rv_err = max(rd['err'].max() for rd in rv_data_list) if rv_data_list else 10.0
+            bounds.append((-max_rv_err**2, 10 * max_rv_err**2))
+    # Per-planet phase curve bounds (ppm)
+    if fitbeam:
+        bounds.append((-500.0, 500.0))         # beam can be positive or negative
+    if fitellip:
+        bounds.append((0.0, 500.0))            # ellipsoidal >= 0
 
     if verbose:
         _log('Starting L-BFGS-B refinement...', verbose)
         class ProgressCallback:
             def __init__(self):
                 self.count = 0
-
             def __call__(self, xk):
                 self.count += 1
                 if self.count % 20 == 0:
-                    _log(f'  Iteration {self.count}: chi2 ~ {joint_negloglike(xk, tran_data, rv_data, sedfile, priors, e, omega, rv_jittervar, tran_addvar, use_mist, mstar_prior, age_prior, sed_data=sed_data):.2f}', verbose)
+                    _log(f'  Iteration {self.count}: chi2 ~ {_chi2_func(xk):.2f}', verbose)
         callback = ProgressCallback()
     else:
         callback = None
 
-    res = minimize(joint_negloglike, amoeba_sol,
-                   args=(tran_data, rv_data, sedfile, priors,
-                         e, omega, rv_jittervar, tran_addvar,
-                         use_mist, mstar_prior, age_prior, sed_data),
+    res = minimize(_chi2_func, amoeba_sol,
                    method='L-BFGS-B', bounds=bounds, callback=callback,
                    options={'maxiter': 10000, 'ftol': 1e-12})
 
-    bf = res.x
-    idx = 0
-    if use_mist:
-        mstar_f = bf[idx]
-        idx += 1
-        age_f = bf[idx]
-        idx += 1
-    else:
-        mstar_f = mstar_prior
-        age_f = age_prior
-    teff_f, rstar_f, feh_f, av_f, dist_f = bf[idx:idx+5]
-    idx += 5
-    tc_f, period_f, p_f, cosi_f = bf[idx:idx+4]
-    idx += 4
-    u1_f, u2_f, f0_f = bf[idx:idx+3]
-    idx += 3
-    K_f, gamma_f = bf[idx:idx+2]
+    # Update SS from optimized parameters
+    _update_ss_from_params(ss, res.x, pnames, e, omega)
 
-    logg_f = _derive_logg(mstar_f, rstar_f)
-    lstar_f = _derive_lstar(teff_f, rstar_f)
-    ar_f = _derive_ar(period_f, mstar_f, rstar_f)
-    inc_f = np.arccos(cosi_f)
-    b_f = ar_f * cosi_f
-
-    ndata = len(tran_data['bjd']) + len(rv_data['bjd']) + 9  # 9 SED bands
-    ndof = ndata - len(param_names)
-    nfit = ndata - ndof
-    bic = res.fun + nfit * np.log(ndata)
-    aic = res.fun + 2 * nfit
-
-    result = {
-        'teff': teff_f, 'rstar': rstar_f, 'feh': feh_f,
-        'av': av_f, 'distance': dist_f,
-        'tc': tc_f, 'period': period_f, 'p': p_f, 'cosi': cosi_f,
-        'u1': u1_f, 'u2': u2_f, 'f0': f0_f,
-        'K': K_f, 'gamma': gamma_f,
-        'logg': logg_f, 'lstar': lstar_f, 'ar': ar_f,
-        'inc_rad': inc_f, 'ideg': np.degrees(inc_f),
-        'b': b_f, 'delta': p_f**2,
-        'parallax': 1000.0 / dist_f, 'mstar': mstar_f,
-        'age': age_f,
-        'e': e, 'omega': omega,
-        'rv_jittervar': rv_jittervar, 'tran_addvar': tran_addvar,
-        'chi2': res.fun, 'ndata': ndata, 'ndof': ndof,
-        'chi2_red': res.fun / ndof if ndof > 0 else np.nan,
-        'bic': bic, 'aic': aic,
-        'success': res.success, 'message': res.message,
-        'param_names': param_names, 'use_mist': use_mist,
-    }
+    # Fit diagnostics
+    nsed = len(sed_data['mag']) if sed_data is not None else 0
+    ndata_tran = sum(len(td['bjd']) for td in tran_data_list)
+    ndata_rv = sum(len(rd['bjd']) for rd in rv_data_list)
+    ndata = ndata_tran + ndata_rv + nsed
+    ndof = ndata - len(pnames)
+    nfit = len(pnames)
+    ss.chi2 = res.fun
+    ss.ndata = ndata
+    ss.ndof = ndof
+    ss.chi2_red = res.fun / ndof if ndof > 0 else np.nan
+    ss.bic = res.fun + nfit * np.log(ndata)
+    ss.aic = res.fun + 2 * nfit
+    ss.success = res.success
+    ss.message = str(res.message)
 
     if verbose:
         _log_section('Optimizer Summary', verbose)
-        _log(f"Mstar    = {mstar_f:.4f} Msun", verbose)
+        _log(f"Mstar    = {ss['mstar']:.4f} Msun", verbose)
         if use_mist:
-            _log(f"Age      = {age_f:.3f} Gyr", verbose)
-        _log(f"Teff     = {teff_f:.1f} K", verbose)
-        _log(f"Rstar    = {rstar_f:.4f} Rsun", verbose)
-        _log(f"[Fe/H]   = {feh_f:.4f}", verbose)
-        _log(f"Av       = {av_f:.4f}", verbose)
-        _log(f"Distance = {dist_f:.2f} pc (plx = {1000./dist_f:.4f} mas)", verbose)
-        _log(f"logg     = {logg_f:.4f}", verbose)
-        _log(f"Lstar    = {lstar_f:.4f} Lsun", verbose)
+            _log(f"Age      = {ss['age']:.3f} Gyr", verbose)
+        _log(f"Teff     = {ss['teff']:.1f} K", verbose)
+        _log(f"Rstar    = {ss['rstar']:.4f} Rsun", verbose)
+        _log(f"[Fe/H]   = {ss['feh']:.4f}", verbose)
+        _log(f"Av       = {ss['av']:.4f}", verbose)
+        _log(f"Distance = {ss['distance']:.2f} pc (plx = {ss['parallax']:.4f} mas)", verbose)
+        _log(f"logg     = {ss['logg']:.4f}", verbose)
+        _log(f"Lstar    = {ss['lstar']:.4f} Lsun", verbose)
         _log('---', verbose)
-        _log(f"Tc       = {tc_f:.5f}", verbose)
-        _log(f"Period   = {period_f:.6f} d", verbose)
-        _log(f"Rp/Rs    = {p_f:.4f}", verbose)
-        _log(f"cosi     = {cosi_f:.4f} (i = {np.degrees(inc_f):.2f} deg)", verbose)
-        _log(f"a/Rs     = {ar_f:.2f}", verbose)
-        _log(f"b        = {b_f:.4f}", verbose)
-        _log(f"u1       = {u1_f:.4f}", verbose)
-        _log(f"u2       = {u2_f:.4f}", verbose)
-        _log(f"f0       = {f0_f:.5f}", verbose)
+        _log(f"Tc       = {ss['tc']:.5f}", verbose)
+        _log(f"Period   = {ss['period']:.6f} d", verbose)
+        _log(f"Rp/Rs    = {ss['p']:.4f}", verbose)
+        _log(f"cosi     = {ss['cosi']:.4f} (i = {ss['ideg']:.2f} deg)", verbose)
+        _log(f"a/Rs     = {ss['ar']:.2f}", verbose)
+        _log(f"b        = {ss['b']:.4f}", verbose)
+        for j in range(nbands):
+            _log(f"u1_{j}     = {ss[f'u1_{j}']:.4f}", verbose)
+            _log(f"u2_{j}     = {ss[f'u2_{j}']:.4f}", verbose)
+        for j in range(ntran):
+            _log(f"f0_{j}     = {ss[f'f0_{j}']:.5f}", verbose)
         _log('---', verbose)
-        _log(f"K        = {K_f:.2f} m/s", verbose)
-        _log(f"gamma    = {gamma_f:.2f} m/s", verbose)
+        _log(f"K        = {ss['K']:.2f} m/s", verbose)
+        if not circular:
+            _log(f"e        = {ss['e']:.4f}", verbose)
+            _log(f"omega    = {ss['omega']:.4f} rad ({np.degrees(ss['omega']):.2f} deg)", verbose)
+            _log(f"sesinw   = {ss['sesinw']:.4f}", verbose)
+            _log(f"secosw   = {ss['secosw']:.4f}", verbose)
+        for j in range(ntel):
+            _log(f"gamma_{j}  = {ss[f'gamma_{j}']:.2f} m/s", verbose)
+        if fitthermal or fitreflect or fitbeam or fitellip:
+            _log('---', verbose)
+            if fitthermal:
+                for j in range(nbands):
+                    _log(f"thermal_{j} = {ss[f'thermal_{j}']:.1f} ppm", verbose)
+            if fitreflect:
+                for j in range(nbands):
+                    _log(f"reflect_{j} = {ss[f'reflect_{j}']:.1f} ppm", verbose)
+            if fitbeam:
+                _log(f"beam     = {ss['beam']:.1f} ppm", verbose)
+            if fitellip:
+                _log(f"ellip    = {ss['ellipsoidal']:.1f} ppm", verbose)
         _log('---', verbose)
-        _log(f"Chi2     = {res.fun:.4f}", verbose)
-        _log(f"Chi2/dof = {result['chi2_red']:.4f}", verbose)
-        _log(f"NDATA    = {ndata}", verbose)
+        _log(f"Chi2     = {ss.chi2:.4f}", verbose)
+        _log(f"Chi2/dof = {ss.chi2_red:.4f}", verbose)
+        _log(f"NDATA    = {ndata} (tran={ndata_tran}, rv={ndata_rv}, sed={nsed})", verbose)
         _log(f"NFIT     = {nfit}", verbose)
-        _log(f"BIC      = {bic:.4f}", verbose)
-        _log(f"AIC      = {aic:.4f}", verbose)
-        _log(f"Success  = {res.success}", verbose)
+        _log(f"BIC      = {ss.bic:.4f}", verbose)
+        _log(f"AIC      = {ss.aic:.4f}", verbose)
+        _log(f"Success  = {ss.success}", verbose)
         end_time = datetime.utcnow()
         elapsed = end_time - start_time
         _log_section('Run Complete', verbose)
         _log(f'End time (UTC): {end_time:%Y-%m-%d %H:%M:%S}', verbose)
         _log(f'Elapsed       : {elapsed}', verbose)
 
-    return result
+    return ss
 
 
 def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
-             e=0.0, omega=np.pi/2, nchains=None, nsteps=2000,
+             e=0.0, omega=np.pi/2, circular=True, usevcve=False,
+             nchains=None, nsteps=2000,
              ntemps=1, verbose=True, use_mist=False, nthreads=None,
-             checkpoint=None, checkpoint_every=0, resume=True):
+             checkpoint=None, checkpoint_every=0, resume=True, nstars=1,
+             fitjittervar=False, fitvariance=False,
+             fitttv=False,
+             fitthermal=False, fitreflect=False,
+             fitbeam=False, fitellip=False):
     """Run DEMC-PT MCMC sampling around the best-fit joint solution."""
     from exozippy.sed.utils import read_sed_file
 
+    has_sed = sedfile is not None
     priors = parse_priors(priorfile)
-    tran_data = read_transit_data(tranfile)
-    rv_data = read_rv_data(rvfile)
-    sed_data = read_sed_file(sedfile, 1) if sedfile is not None else None
+    tran_data_list, tranfiles = read_all_transit_data(tranfile)
+    rv_data_list, rvfiles = read_all_rv_data(rvfile)
+    sed_data = read_sed_file(sedfile, nstars) if has_sed else None
     mstar_prior = priors.get('mstar', {}).get('value', 1.0)
     age_prior = priors.get('age', {}).get('value', 1.0)
-    rv_jittervar = priors.get('jittervar', {}).get('value', 0.0)
-    tran_addvar = priors.get('variance', {}).get('value', 0.0)
+
+    ntran = len(tran_data_list)
+    ntel = len(rv_data_list)
+    nbands = 1
+
+    rv_jittervar_list = [priors.get(f'jittervar_{j}', {}).get('value', 0.0)
+                         for j in range(ntel)]
+    tran_addvar_list = [priors.get(f'variance_{j}', {}).get('value', 0.0)
+                        for j in range(ntran)]
+
+    # Compute epoch list for TTV
+    _fitttv = fitttv and ntran >= 3
+    epoch_list = None
+    if _fitttv:
+        tc_prior = priors.get('tc', {}).get('value', None)
+        period_prior = priors.get('period_0', priors.get('period', {}))
+        period_prior = period_prior.get('value', 3.0) if isinstance(period_prior, dict) else 3.0
+        if tc_prior is not None and period_prior > 0:
+            epoch_list = [int(round((float(np.median(td['bjd'])) - tc_prior) / period_prior))
+                          for td in tran_data_list]
+        else:
+            _fitttv = False
 
     if bestfit is None:
         bestfit = fit_exoplanet(priorfile, tranfile, rvfile, sedfile,
-                                e=e, omega=omega, verbose=verbose,
-                                use_mist=use_mist)
+                                e=e, omega=omega, circular=circular,
+                                usevcve=usevcve, verbose=verbose,
+                                use_mist=use_mist, nstars=nstars,
+                                fitjittervar=fitjittervar, fitvariance=fitvariance,
+                                fitttv=_fitttv,
+                                fitthermal=fitthermal, fitreflect=fitreflect,
+                                fitbeam=fitbeam, fitellip=fitellip)
 
-    param_names = bestfit.get('param_names') or _param_names(use_mist)
-    name_to_idx = {name: i for i, name in enumerate(param_names)}
-    x_best = np.array([bestfit[n] for n in param_names])
+    pc_kwargs = dict(fitjittervar=fitjittervar, fitvariance=fitvariance,
+                     fitttv=_fitttv,
+                     fitthermal=fitthermal, fitreflect=fitreflect,
+                     fitbeam=fitbeam, fitellip=fitellip,
+                     usevcve=usevcve)
+    pnames = bestfit.param_names if isinstance(bestfit, SS) else (bestfit.get('param_names') or _param_names(use_mist, nstars=nstars, has_sed=has_sed, ntran=ntran, ntel=ntel, nbands=nbands, circular=circular, **pc_kwargs))
+    name_to_idx = {name: i for i, name in enumerate(pnames)}
+    x_best = np.array([bestfit[n] for n in pnames])
     ndim = len(x_best)
 
-    # Default nchains = 2 * ndim (EXOFASTv2 convention), minimum 3
     if nchains is None:
         nchains = max(2 * ndim, 3)
 
-    # Initialization scatter
-    if use_mist:
-        scales = np.concatenate(([0.02, 0.5], BASE_SCALES))
-    else:
-        scales = BASE_SCALES
+    ar_init = bestfit['ar'] if isinstance(bestfit, SS) else bestfit.get('ar', 10.0)
+    scales = _param_scales(use_mist, nstars=nstars, has_sed=has_sed,
+                           ntran=ntran, ntel=ntel, nbands=nbands,
+                           circular=circular, ar_init=ar_init, **pc_kwargs)
 
     if verbose:
         print(f"=== DEMC-PT: {nchains} chains, {ntemps} temps, {nsteps} steps ===")
 
     log_posterior = functools.partial(
         _mcmc_log_posterior,
-        tran_data=tran_data, rv_data=rv_data, sedfile=sedfile,
-        priors=priors, sed_data=sed_data, e=e, omega=omega,
-        rv_jittervar=rv_jittervar, tran_addvar=tran_addvar,
+        tran_data_list=tran_data_list, rv_data_list=rv_data_list,
+        sedfile=sedfile, priors=priors, sed_data=sed_data,
+        e=e, omega=omega,
+        rv_jittervar_list=rv_jittervar_list,
+        tran_addvar_list=tran_addvar_list,
         use_mist=use_mist, mstar_fixed=mstar_prior,
-        age_prior=age_prior,
+        age_prior=age_prior, nstars=nstars,
+        ntran=ntran, ntel=ntel, nbands=nbands,
+        circular=circular, epoch_list=epoch_list,
+        **pc_kwargs,
     )
 
     sampler = None
@@ -538,14 +675,16 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
                     nworkers=nthreads or 1,
                     save_every=save_every,
                     save_file=checkpoint)
+    # Raw chain: (nsteps, nchains, ndim) — for arviz trace/corner plots
+    raw_chain = sampler.chain
+    raw_log_prob = sampler.log_prob
+
     samples = sampler.flatchain
     flatlog = sampler.flatlog_prob
     if samples is None or len(samples) == 0:
-        # fallback: use full chain with manual burn-in
-        chain = sampler.chain
-        burn = max(chain.shape[0] // 4, 1)
-        samples = chain[burn:].reshape(-1, ndim)
-        flatlog = sampler.log_prob[burn:].reshape(-1)
+        burn = max(raw_chain.shape[0] // 4, 1)
+        samples = raw_chain[burn:].reshape(-1, ndim)
+        flatlog = raw_log_prob[burn:].reshape(-1)
 
     if samples.size == 0:
         raise RuntimeError("No MCMC samples generated.")
@@ -555,20 +694,40 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
     if flatlog is not None and len(flatlog) == len(samples):
         imax = int(np.nanargmax(flatlog))
         map_params = samples[imax]
-        bestfit_mcmc = _bestfit_from_params(
-            map_params, param_names, e, omega, mstar_prior, age_prior, use_mist
+
+        bestfit_mcmc = mkss(
+            parfile=priorfile,
+            tranpath=tranfile,
+            rvpath=rvfile,
+            sedfile=sedfile,
+            use_mist=use_mist,
+            nstars=nstars,
+            circular=circular,
+            **pc_kwargs,
         )
-        bestfit_mcmc['chi2'] = -2.0 * flatlog[imax]
+        _update_ss_from_params(bestfit_mcmc, map_params, pnames, e, omega)
+        bestfit_mcmc.chi2 = -2.0 * flatlog[imax]
 
     def _arr(name):
         return samples[:, name_to_idx[name]]
 
-    mstar_arr = _arr('mstar') if 'mstar' in name_to_idx else np.full(samples.shape[0], mstar_prior)
+    # Stellar mass: stored as logmstar in param vector when use_mist, convert to linear
+    if 'logmstar' in name_to_idx:
+        mstar_arr = 10.0**_arr('logmstar')
+    elif 'mstar' in name_to_idx:
+        mstar_arr = _arr('mstar')
+    else:
+        mstar_arr = np.full(samples.shape[0], mstar_prior)
     rstar_arr = _arr('rstar')
     teff_arr = _arr('teff')
-    period_arr = _arr('period')
+    # Period: stored as logP in param vector, convert to linear
+    if 'logP' in name_to_idx:
+        period_arr = 10.0**_arr('logP')
+    elif 'period' in name_to_idx:
+        period_arr = _arr('period')
+    else:
+        period_arr = np.full(samples.shape[0], bestfit['period'])
     cosi_arr = _arr('cosi')
-    distance_arr = _arr('distance')
 
     # Derived parameter arrays
     logg_s = _derive_logg(mstar_arr, rstar_arr)
@@ -576,11 +735,16 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
     ar_s = _derive_ar(period_arr, mstar_arr, rstar_arr)
     ideg_s = np.degrees(np.arccos(cosi_arr))
     b_s = ar_s * cosi_arr
-    plx_s = 1000.0 / distance_arr
+
+    derived_list = [('logg', logg_s), ('lstar', lstar_s), ('ar', ar_s),
+                    ('ideg', ideg_s), ('b', b_s)]
+    if 'distance' in name_to_idx:
+        distance_arr = _arr('distance')
+        plx_s = 1000.0 / distance_arr
+        derived_list.append(('parallax', plx_s))
 
     summary = {}
-    # Free parameters
-    for i, name in enumerate(param_names):
+    for i, name in enumerate(pnames):
         med = np.median(samples[:, i])
         lo = np.percentile(samples[:, i], 15.87)
         hi = np.percentile(samples[:, i], 84.13)
@@ -588,9 +752,7 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
         if verbose:
             print(f"{name:10s} = {med:.4f}  -{med-lo:.4f}  +{hi-med:.4f}")
 
-    # Derived parameters
-    for name, arr in [('logg', logg_s), ('lstar', lstar_s), ('ar', ar_s),
-                      ('ideg', ideg_s), ('b', b_s), ('parallax', plx_s)]:
+    for name, arr in derived_list:
         med = np.median(arr)
         lo = np.percentile(arr, 15.87)
         hi = np.percentile(arr, 84.13)
@@ -598,4 +760,12 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
         if verbose:
             print(f"{name:10s} = {med:.4f}  -{med-lo:.4f}  +{hi-med:.4f}")
 
-    return samples, param_names, summary, bestfit_mcmc
+    # Pack chain info for arviz
+    chain_info = {
+        'chain': raw_chain,           # (nsteps, nchains, ndim)
+        'log_prob': raw_log_prob,     # (nsteps, nchains)
+        'param_names': pnames,
+        'nchains': sampler.nchains,
+    }
+
+    return samples, pnames, summary, bestfit_mcmc, chain_info

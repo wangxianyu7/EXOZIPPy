@@ -1,39 +1,28 @@
-"""
-Python equivalent of fithat3_modern.pro — joint SED + MIST + Transit + RV fit.
-Usage examples:
-    python fithat3.py
-    python fithat3.py --mcmc --nsteps 4000
-    python fithat3.py --nomist --prior hat3.torres.priors
-"""
-import argparse
 import os
-
 from exozippy.exozippy import exozippy
-
+base = os.path.dirname(os.path.abspath(__file__)) + '/'
+ncpus = os.cpu_count()
 
 def main():
-    base = os.path.dirname(os.path.abspath(__file__)) + '/'
 
-    parser = argparse.ArgumentParser(description="High-level EXOZIPPy run for HAT-3b.")
-    parser.add_argument('--prior', default='HAT-3.priors', help='Relative path to prior file.')
-    parser.add_argument('--nomist', action='store_true', help='Disable MIST evolutionary prior.')
-    parser.add_argument('--skipopt', action='store_true', help='Skip optimizer, go straight to MCMC.')
-    parser.add_argument('--mcmc', action='store_true', help='Run DEMC-PT after optimizer.')
-    parser.add_argument('--nsteps', type=int, default=2000, help='MCMC steps per chain.')
-    parser.add_argument('--nchains', type=int, default=None, help='DEMC chains (default: 2*ndim).')
-    parser.add_argument('--ntemps', type=int, default=1, help='Parallel tempering rungs (default: 1).')
-    parser.add_argument('--workers', type=int, default=None, help='Processes for parallel MCMC.')
-    parser.add_argument('--prefix', default=None, help='Output prefix (defaults to fitresults/HAT-3b.<tag>.)')
-    parser.add_argument('--quiet', action='store_true', help='Reduce console output.')
-    args = parser.parse_args()
+    priorfile = 'HAT-3.priors'
+    runmcmc = True
+    nomist = False
+    skipopt = False
+    mcmc_steps = 2000
+    mcmc_nchains = None
+    mcmc_ntemps = 5
+    mcmc_workers = ncpus - 1 if ncpus > 1 else None
+    prefix = 'fitresults/HAT-3b.'
 
-    priorfile = os.path.join(base, args.prior)
-    tranpath = base + 'n20070428.Sloani.KepCam.dat'
-    rvpath = base + 'HAT-3b.HIRES.rv'
+    priorfile = os.path.join(base, priorfile)
+    tranpath = base + 'n20070428.*.dat' # support for glob patterns in transit files
+    rvpath = base + 'HAT-3b.*.rv' # support for glob patterns in RV files
     sedfile = base + 'HAT-3.sed'
-    tag = 'Torres' if args.nomist else 'MIST'
-    prefix = args.prefix or os.path.expanduser(
+    tag = 'Torres' if nomist else 'MIST'
+    prefix = prefix or os.path.expanduser(
         f'~/modeling/hat3/fitresults/HAT-3b.{tag}.')
+
 
     exozippy(
         parfile=priorfile,
@@ -41,14 +30,14 @@ def main():
         rvpath=rvpath,
         sedfile=sedfile,
         prefix=prefix,
-        nomist=args.nomist,
-        skipopt=args.skipopt,
-        run_mcmc_flag=args.mcmc,
-        mcmc_steps=args.nsteps,
-        mcmc_nchains=args.nchains,
-        mcmc_ntemps=args.ntemps,
-        mcmc_threads=args.workers,
-        verbose=not args.quiet,
+        nomist=nomist,
+        skipopt=skipopt,
+        run_mcmc_flag=runmcmc,
+        mcmc_steps=mcmc_steps,
+        mcmc_nchains=mcmc_nchains,
+        mcmc_ntemps=mcmc_ntemps,
+        mcmc_threads=mcmc_workers,
+        verbose=True,
     )
 
 

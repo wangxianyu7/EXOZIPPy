@@ -539,8 +539,8 @@ def exozippy_getb2(bjd, inc, a, tperiastron, period, e=None, omega=None,
     omega = np.atleast_1d(omega if omega is not None else np.ones(nplanets) * (np.pi / 2))
     q = np.atleast_1d(q if q is not None else np.full(nplanets, np.inf))
     
-    b = exozippy_getb2_(bjd, inc, a, tperiastron, period, e, omega, lonascnode, q)
-    return b.squeeze()
+    b, z0 = exozippy_getb2_(bjd, inc, a, tperiastron, period, e, omega, lonascnode, q)
+    return b.squeeze(), z0.squeeze()
 
 
 
@@ -651,7 +651,7 @@ def exozippy_getb2_(
 
     # Impact parameter = projected sky-plane separation
     b = np.sqrt(x0**2 + y0**2)
-    return b  # Return 1D if possible
+    return b, z0
 
 
 
@@ -754,11 +754,20 @@ def exozippy_getphase(
     eccen_arr = np.asarray(eccen, dtype=np.float64)
     omega_arr = np.asarray(omega, dtype=np.float64)
 
+    # Check if trueanom is array — if so, must use the vector path even
+    # when eccen/omega are scalar (broadcast them to match trueanom shape)
+    trueanom_is_array = trueanom is not None and np.ndim(trueanom) > 0
+    if trueanom_is_array:
+        trueanom_arr = np.asarray(trueanom, dtype=np.float64)
+        eccen_arr = np.broadcast_to(eccen_arr, trueanom_arr.shape).copy()
+        omega_arr = np.broadcast_to(omega_arr, trueanom_arr.shape).copy()
+
     if eccen_arr.ndim == 0 and omega_arr.ndim == 0:
+        ta = float(trueanom) if trueanom is not None else None
         return _exozippy_getphase_scalar(
             float(eccen_arr.reshape(1)[0]),
             float(omega_arr.reshape(1)[0]),
-            trueanom=trueanom,
+            trueanom=ta,
             primary=primary,
             secondary=secondary,
             l4=l4,
@@ -777,19 +786,36 @@ def exozippy_getphase(
     omega_flat = omega_arr.reshape(-1)
     phase_flat = phase.reshape(-1)
 
-    for i in range(n):
-        phase_flat[i] = _exozippy_getphase_scalar(
-            float(eccen_flat[i]),
-            float(omega_flat[i]),
-            trueanom=trueanom,
-            primary=primary,
-            secondary=secondary,
-            l4=l4,
-            l5=l5,
-            periastron=periastron,
-            ascendingnode=ascendingnode,
-            descendingnode=descendingnode
-        )
+    if trueanom_is_array:
+        trueanom_flat = trueanom_arr.reshape(-1)
+        for i in range(n):
+            phase_flat[i] = _exozippy_getphase_scalar(
+                float(eccen_flat[i]),
+                float(omega_flat[i]),
+                trueanom=float(trueanom_flat[i]),
+                primary=primary,
+                secondary=secondary,
+                l4=l4,
+                l5=l5,
+                periastron=periastron,
+                ascendingnode=ascendingnode,
+                descendingnode=descendingnode
+            )
+    else:
+        ta = float(trueanom) if trueanom is not None else None
+        for i in range(n):
+            phase_flat[i] = _exozippy_getphase_scalar(
+                float(eccen_flat[i]),
+                float(omega_flat[i]),
+                trueanom=ta,
+                primary=primary,
+                secondary=secondary,
+                l4=l4,
+                l5=l5,
+                periastron=periastron,
+                ascendingnode=ascendingnode,
+                descendingnode=descendingnode
+            )
 
     return phase
 

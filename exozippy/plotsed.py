@@ -153,31 +153,32 @@ def _apply_extinction(lamflam, av):
     return lamflam
 
 
-def _scale_atmosphere(lamflam, lstar, distance):
+def _scale_atmosphere(lamflam, rstar, distance):
     """
-    Scale model atmosphere to observed flux level.
+    Scale model atmosphere to observed flux level using geometric scaling.
 
-    The model lamflam needs to be normalized by Fbol and scaled by (Rstar/d)^2.
-    We use Lstar and distance to do this.
+    Matches IDL EXOFASTv2 (exofast_chi2v2.pro):
+        lamflam_obs = lamflam_surface * (Rstar * Rsun)^2 / (distance * pc)^2
+
+    Parameters
+    ----------
+    lamflam : ndarray
+        Model lambda*F_lambda at the stellar surface.
+    rstar : float
+        Stellar radius in solar radii.
+    distance : float
+        Distance in parsecs.
     """
-    pc_cm = 3.0857e18  # pc in cm
-    lsun_erg = CONSTANTS['LSun']  # erg/s
+    pc_cm = CONSTANTS['pc']      # cm
+    rsun_cm = CONSTANTS['RSun']  # cm
 
-    # Fbol at Earth = Lstar * Lsun / (4 * pi * d^2)
-    fbol = (lstar * lsun_erg) / (4.0 * np.pi * (distance * pc_cm)**2)
-
-    # Integrate model to get its bolometric flux
-    dlambda = 0.001  # um
-    fbol_model = np.sum(lamflam * dlambda / WAVELENGTH)
-
-    if fbol_model > 0:
-        return lamflam / fbol_model * fbol
-    return lamflam
+    scale = (rstar * rsun_cm)**2 / (distance * pc_cm)**2
+    return lamflam * scale
 
 
 # ---------- SED model computation ----------
 
-def _compute_sed_model(teff, logg, feh, av, distance, lstar, sedfile):
+def _compute_sed_model(teff, logg, feh, av, distance, lstar, rstar, sedfile):
     """
     Compute model SED and compare with observations.
 
@@ -246,21 +247,15 @@ def _compute_sed_model(teff, logg, feh, av, distance, lstar, sedfile):
     residuals = (obs_flux - model_flux) / obs_err
 
     # Interpolate model atmosphere for continuous spectrum
-    # Order matches IDL: scale by Fbol first (unextincted), then apply extinction
+    # Matches IDL (exofast_chi2v2.pro):
+    #   lamflam = lamflam_surface * (Rstar*Rsun)^2 / (d*pc)^2  (geometric scaling)
+    #   then apply extinction
     atmosphere = None
     lamflam = _interp_atmosphere(teff, logg, feh)
     if lamflam is not None:
-        lamflam = _scale_atmosphere(lamflam, lstar, distance)
+        lamflam = _scale_atmosphere(lamflam, rstar, distance)
         lamflam = _apply_extinction(lamflam, av)
-        lamflam_arr = lamflam if lamflam.ndim == 1 else lamflam.squeeze()
-        synthetic = np.dot(filter_curves, lamflam_arr) / np.where(filter_curve_sum > 0, filter_curve_sum, 1.0)
-        mask = np.isfinite(synthetic) & (synthetic > 0)
-        if np.any(mask):
-            weights = np.where(np.isfinite(model_flux[mask]), 1.0 / np.maximum(obs_err[mask], 1e-30)**2, 1.0)
-            scale = np.average(model_flux[mask] / synthetic[mask], weights=weights)
-            if np.isfinite(scale) and scale > 0:
-                lamflam_arr = lamflam_arr * scale
-        atmosphere = (WAVELENGTH, lamflam_arr)
+        atmosphere = (WAVELENGTH, lamflam)
 
     return {
         'weff': weff,
@@ -290,11 +285,13 @@ def plotsed(sedfile, bestfit, outfile=None):
         Top (height 3):    log(lambda F_lambda) vs lambda
         Bottom (height 1): O-C residuals (sigma)
 
+    Supports multi-star: overlays each star's atmosphere with different colors.
+
     Parameters
     ----------
     sedfile : str
         Path to SED data file.
-    bestfit : dict
+    bestfit : dict or SS
         Best-fit parameter dictionary from fit_exoplanet.
     outfile : str, optional
         Output filename (.png or .pdf).
@@ -304,16 +301,22 @@ def plotsed(sedfile, bestfit, outfile=None):
     -------
     fig : Figure
     """
-    # Extract stellar parameters
+    from .ss import SS
+
+    # Determine nstars
+    nstars = bestfit.nstars if isinstance(bestfit, SS) else 1
+
+    # Extract primary star parameters (for model band fluxes / residuals)
     teff = bestfit['teff']
     logg = bestfit['logg']
     feh = bestfit['feh']
     av = bestfit['av']
     distance = bestfit['distance']
     lstar = bestfit['lstar']
+    rstar = bestfit['rstar']
 
-    # Compute model
-    sed = _compute_sed_model(teff, logg, feh, av, distance, lstar, sedfile)
+    # Compute model (using primary star for band fluxes)
+    sed = _compute_sed_model(teff, logg, feh, av, distance, lstar, rstar, sedfile)
     weff = sed['weff']
     widtheff = sed['widtheff']
     obs_flux = sed['obs_flux']
@@ -340,23 +343,47 @@ def plotsed(sedfile, bestfit, outfile=None):
     ax_oc = fig.add_subplot(outer[1], sharex=ax_data)
 
     # --- Top panel: SED ---
-    # Model atmosphere continuous spectrum (black line)
-    if atmosphere is not None:
+    # Model atmosphere continuous spectrum
+    from scipy.ndimage import uniform_filter1d
+    _atm_colors = ['black', 'gray', 'steelblue', 'darkgreen', 'purple']
+
+    if nstars > 1:
+        # Multi-star: overlay each star's atmosphere
+        for i in range(nstars):
+            suffix = f'_{i}' if nstars > 1 else ''
+            teff_i = bestfit[f'teff{suffix}']
+            logg_i = bestfit[f'logg{suffix}']
+            feh_i = bestfit[f'feh{suffix}']
+            av_i = bestfit[f'av{suffix}']
+            dist_i = bestfit[f'distance{suffix}']
+            rstar_i = bestfit[f'rstar{suffix}']
+            lamflam_i = _interp_atmosphere(teff_i, logg_i, feh_i)
+            if lamflam_i is not None:
+                lamflam_i = _scale_atmosphere(lamflam_i, rstar_i, dist_i)
+                lamflam_i = _apply_extinction(lamflam_i, av_i)
+                lamflam_smooth = uniform_filter1d(lamflam_i, size=10)
+                mask = lamflam_smooth > 0
+                color = _atm_colors[i % len(_atm_colors)]
+                label = f'Star {chr(65+i)}' if nstars > 1 else 'Model atmosphere'
+                ax_data.plot(WAVELENGTH[mask], np.log10(lamflam_smooth[mask]), '-',
+                             color=color, lw=1, zorder=1, label=label)
+    elif atmosphere is not None:
         wav, lamflam = atmosphere
-        # Smooth for plotting (like IDL smooth(...,10))
-        from scipy.ndimage import uniform_filter1d
         lamflam_smooth = uniform_filter1d(lamflam, size=10)
-        # Only plot where flux is positive
         mask = lamflam_smooth > 0
         ax_data.plot(wav[mask], np.log10(lamflam_smooth[mask]), '-', color='black',
                      lw=1, zorder=1, label='Model atmosphere')
 
     # Model band fluxes (blue circles)
-    ax_data.plot(weff, np.log10(model_lamflam), 'o', color='blue',
+    safe_model = np.where(model_lamflam > 0, model_lamflam, np.nan)
+    ax_data.plot(weff, np.log10(safe_model), 'o', color='blue',
                  ms=8, mfc='blue', mec='blue', zorder=3, label='Model bands')
 
     # Observed fluxes (red points with error bars)
+    safe_obs = np.where(obs_lamflam > 0, obs_lamflam, np.nan)
     for i in range(len(weff)):
+        if obs_lamflam[i] <= 0:
+            continue
         # y error bar
         y_lo = np.log10(obs_lamflam[i] - obs_lamflam_err[i]) if obs_lamflam[i] > obs_lamflam_err[i] else np.log10(obs_lamflam[i]) - 0.5
         y_hi = np.log10(obs_lamflam[i] + obs_lamflam_err[i])
@@ -366,17 +393,22 @@ def plotsed(sedfile, bestfit, outfile=None):
                      [np.log10(obs_lamflam[i]), np.log10(obs_lamflam[i])],
                      '-', color='red', lw=1.5, zorder=2)
 
-    ax_data.plot(weff, np.log10(obs_lamflam), 'o', color='red',
+    ax_data.plot(weff, np.log10(safe_obs), 'o', color='red',
                  ms=6, mfc='red', mec='red', zorder=4, label='Observed')
 
     ax_data.set_xscale('log')
     ax_data.set_ylabel(r'log $\lambda F_\lambda$ (erg s$^{-1}$ cm$^{-2}$)')
     ax_data.set_xlim(0.3, 30)
 
-    # Set y limits based on data
-    all_log = np.log10(np.concatenate([obs_lamflam, model_lamflam]))
-    ymin = np.min(all_log) - 0.3
-    ymax = np.max(all_log) + 0.3
+    # Set y limits based on data (guard against zero/negative fluxes)
+    all_vals = np.concatenate([obs_lamflam, model_lamflam])
+    pos_mask = all_vals > 0
+    if np.any(pos_mask):
+        all_log = np.log10(all_vals[pos_mask])
+        ymin = np.min(all_log) - 0.3
+        ymax = np.max(all_log) + 0.3
+    else:
+        ymin, ymax = -12, -8
     ax_data.set_ylim(ymin, ymax)
 
     ax_data.legend(loc='upper right', frameon=False)

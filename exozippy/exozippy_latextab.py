@@ -80,7 +80,7 @@ def exozippy_latextab(summary, path, caption=None, label=None,
     lines.append(r"\providecommand{\re}{\ensuremath{\,R_{\rm E}}}")
     lines.append(r"\providecommand{\fave}{\langle F \rangle}")
     lines.append(r"\providecommand{\fluxcgs}{10$^9$ erg s$^{-1}$ cm$^{-2}$}")
-    lines.append(r"\usepackage{apjfonts}")
+    # lines.append(r"\usepackage{apjfonts}")
     lines.append(r"\begin{document}")
     lines.append(r"\startlongtable")
     lines.append(r"\begin{deluxetable*}{lcc}")

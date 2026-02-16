@@ -63,14 +63,14 @@ def exozippy_tran(
         transitbjd = time
 
     # The impact parameter for each BJD
-    z = exozippy_getb2(transitbjd, inc=inc, a=ar, tperiastron=tp, period=period,
+    z, z2 = exozippy_getb2(transitbjd, inc=inc, a=ar, tperiastron=tp, period=period,
                       e=e, omega=omega, q=q)
     ntime = len(time)
 
-    # Primary transit
+    # Primary transit: planet in front of star (z2 < 0)
+    # Secondary eclipse: planet behind star (z2 >= 0)
     modelflux = np.ones(ntime)
-    depth = np.zeros_like(z) - 1.0  # Placeholder for z2
-    primary = depth < 0
+    primary = z2 < 0
     secondary = ~primary
     
     if primary.any():
