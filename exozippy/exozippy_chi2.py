@@ -52,9 +52,13 @@ _LSINW_SCALE = 0.1                     # lsinw
 _LCOSW_SCALE = 0.1                     # lcosw
 _SIGN_SCALE = 0.1                      # sign (root selector)
 _JITTERVAR_SCALE = 1.0                 # per telescope, m^2/s^2
+_SLOPE_SCALE = 1.0                     # global, m/s/day
+_QUAD_SCALE = 1.0                      # global, m/s/day^2
 _VARIANCE_SCALE = 1e-8                 # per transit, flux^2
 _DILUTE_SCALE = 0.01                   # per transit, dilution fraction
 _TTV_SCALE = 0.02                      # per transit, days (~30 min)
+_DETREND_TRAN_SCALE = 0.1              # per transit detrend coeff
+_DETREND_RV_SCALE = 1.0                # per telescope detrend coeff
 
 # Legacy single-instrument constants (for backward compat imports)
 BASE_PLANET_PARAMS = [
@@ -76,18 +80,22 @@ INF_CHI2 = 1e10  # sentinel for impossible parameters
 def param_names(use_mist: bool, nstars: int = 1, has_sed: bool = True,
                 ntran: int = 1, ntel: int = 1, nbands: int = 1,
                 circular: bool = True, usevcve: bool = False,
-                fitjittervar: bool = False, fitvariance: bool = False,
+                fitjittervar: bool = False, fitslope: bool = False,
+                fitquad: bool = False, fitvariance: bool = False,
                 fitdilute: bool = False, fitttv: bool = False,
                 fitthermal: bool = False, fitreflect: bool = False,
-                fitbeam: bool = False, fitellip: bool = False):
+                fitbeam: bool = False, fitellip: bool = False,
+                detrend_info: dict = None):
     """Return the ordered parameter name list.
 
     Layout: [stellar...] [shared orbital] [sesinw secosw? | vcve lsinw lcosw sign?]
             [per-band LD]
             [per-band thermal?] [per-band reflect?]
-            [per-transit f0] [per-transit variance?] [per-transit ttv?]
+            [per-transit f0] [per-transit variance?] [per-transit dilute?]
+            [per-transit ttv?] [per-transit detrend?]
             [per-telescope gamma] [per-telescope jittervar?]
-            [beam?] [ellipsoidal?]
+            [per-telescope detrend?]
+            [slope?] [quad?] [beam?] [ellipsoidal?]
     """
     stellar = BASE_STELLAR_PARAMS if has_sed else NOSED_STELLAR_PARAMS
     names = []
@@ -130,6 +138,13 @@ def param_names(use_mist: bool, nstars: int = 1, has_sed: bool = True,
     if fitttv:
         for j in range(ntran):
             names.append(f'ttv_{j}')
+    # Per-transit detrend coefficients
+    if detrend_info is not None:
+        for j in range(ntran):
+            for k in range(detrend_info.get('tran_nadd', [0] * ntran)[j] if j < len(detrend_info.get('tran_nadd', [])) else 0):
+                names.append(f'C{k}_{j}')
+            for k in range(detrend_info.get('tran_nmult', [0] * ntran)[j] if j < len(detrend_info.get('tran_nmult', [])) else 0):
+                names.append(f'M{k}_{j}')
     # Per-telescope gamma
     for j in range(ntel):
         names.append(f'gamma_{j}')
@@ -137,6 +152,18 @@ def param_names(use_mist: bool, nstars: int = 1, has_sed: bool = True,
     if fitjittervar:
         for j in range(ntel):
             names.append(f'jittervar_{j}')
+    # Per-telescope detrend coefficients
+    if detrend_info is not None:
+        for j in range(ntel):
+            for k in range(detrend_info.get('rv_nadd', [0] * ntel)[j] if j < len(detrend_info.get('rv_nadd', [])) else 0):
+                names.append(f'RVC{k}_{j}')
+            for k in range(detrend_info.get('rv_nmult', [0] * ntel)[j] if j < len(detrend_info.get('rv_nmult', [])) else 0):
+                names.append(f'RVM{k}_{j}')
+    # Global RV trend (fitquad implies fitslope)
+    if fitslope or fitquad:
+        names.append('slope')
+    if fitquad:
+        names.append('quad')
     # Per-planet phase curve params
     if fitbeam:
         names.append('beam')
@@ -149,10 +176,12 @@ def param_scales(use_mist: bool, nstars: int = 1, has_sed: bool = True,
                  ntran: int = 1, ntel: int = 1, nbands: int = 1,
                  circular: bool = True, usevcve: bool = False,
                  ar_init: float = None,
-                 fitjittervar: bool = False, fitvariance: bool = False,
+                 fitjittervar: bool = False, fitslope: bool = False,
+                 fitquad: bool = False, fitvariance: bool = False,
                  fitdilute: bool = False, fitttv: bool = False,
                  fitthermal: bool = False, fitreflect: bool = False,
-                 fitbeam: bool = False, fitellip: bool = False):
+                 fitbeam: bool = False, fitellip: bool = False,
+                 detrend_info: dict = None):
     """Return scales matching param_names ordering.
 
     Parameters
@@ -189,9 +218,31 @@ def param_scales(use_mist: bool, nstars: int = 1, has_sed: bool = True,
         scales.append(np.full(ntran, _DILUTE_SCALE))
     if fitttv:
         scales.append(np.full(ntran, _TTV_SCALE))
+    # Per-transit detrend scales
+    if detrend_info is not None:
+        for j in range(ntran):
+            nadd = detrend_info.get('tran_nadd', [0] * ntran)[j] if j < len(detrend_info.get('tran_nadd', [])) else 0
+            nmult = detrend_info.get('tran_nmult', [0] * ntran)[j] if j < len(detrend_info.get('tran_nmult', [])) else 0
+            if nadd > 0:
+                scales.append(np.full(nadd, _DETREND_TRAN_SCALE))
+            if nmult > 0:
+                scales.append(np.full(nmult, _DETREND_TRAN_SCALE))
     scales.append(np.full(ntel, _GAMMA_SCALE))
     if fitjittervar:
         scales.append(np.full(ntel, _JITTERVAR_SCALE))
+    # Per-telescope detrend scales
+    if detrend_info is not None:
+        for j in range(ntel):
+            nadd = detrend_info.get('rv_nadd', [0] * ntel)[j] if j < len(detrend_info.get('rv_nadd', [])) else 0
+            nmult = detrend_info.get('rv_nmult', [0] * ntel)[j] if j < len(detrend_info.get('rv_nmult', [])) else 0
+            if nadd > 0:
+                scales.append(np.full(nadd, _DETREND_RV_SCALE))
+            if nmult > 0:
+                scales.append(np.full(nmult, _DETREND_RV_SCALE))
+    if fitslope or fitquad:
+        scales.append(np.array([_SLOPE_SCALE]))
+    if fitquad:
+        scales.append(np.array([_QUAD_SCALE]))
     if fitbeam:
         scales.append(np.array([_BEAM_SCALE]))
     if fitellip:
@@ -206,10 +257,13 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
                   priors=None, nstars=1, has_sed=True,
                   ntran=1, ntel=1, nbands=1,
                   circular=True, usevcve=False,
-                  fitjittervar=False, fitvariance=False,
+                  fitjittervar=False, fitslope=False, fitquad=False,
+                  fitvariance=False,
                   fitdilute=False, fitttv=False, epoch_list=None,
+                  rvepoch=0.0,
                   fitthermal=False, fitreflect=False,
-                  fitbeam=False, fitellip=False):
+                  fitbeam=False, fitellip=False,
+                  detrend_info=None):
     """
     Unpack the flat parameter vector into a named dict.
 
@@ -333,6 +387,22 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
             tc = coeffs[1]       # intercept
             logP = np.log10(period) if period > 0 else logP
 
+    # Per-transit detrend coefficients
+    tran_detrendadd = []   # list of lists
+    tran_detrendmult = []
+    if detrend_info is not None:
+        for j in range(ntran):
+            nadd = detrend_info.get('tran_nadd', [0] * ntran)[j] if j < len(detrend_info.get('tran_nadd', [])) else 0
+            coeffs_add = []
+            for _ in range(nadd):
+                coeffs_add.append(params[idx]); idx += 1
+            tran_detrendadd.append(coeffs_add)
+            nmult = detrend_info.get('tran_nmult', [0] * ntran)[j] if j < len(detrend_info.get('tran_nmult', [])) else 0
+            coeffs_mult = []
+            for _ in range(nmult):
+                coeffs_mult.append(params[idx]); idx += 1
+            tran_detrendmult.append(coeffs_mult)
+
     # Per-telescope gamma
     gamma_list = []
     for j in range(ntel):
@@ -343,6 +413,30 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
     if fitjittervar:
         for j in range(ntel):
             jittervar_list.append(params[idx]); idx += 1
+
+    # Per-telescope detrend coefficients
+    rv_detrendadd = []
+    rv_detrendmult = []
+    if detrend_info is not None:
+        for j in range(ntel):
+            nadd = detrend_info.get('rv_nadd', [0] * ntel)[j] if j < len(detrend_info.get('rv_nadd', [])) else 0
+            coeffs_add = []
+            for _ in range(nadd):
+                coeffs_add.append(params[idx]); idx += 1
+            rv_detrendadd.append(coeffs_add)
+            nmult = detrend_info.get('rv_nmult', [0] * ntel)[j] if j < len(detrend_info.get('rv_nmult', [])) else 0
+            coeffs_mult = []
+            for _ in range(nmult):
+                coeffs_mult.append(params[idx]); idx += 1
+            rv_detrendmult.append(coeffs_mult)
+
+    # Global RV trend
+    slope_val = 0.0
+    quad_val = 0.0
+    if fitslope or fitquad:
+        slope_val = params[idx]; idx += 1
+    if fitquad:
+        quad_val = params[idx]; idx += 1
 
     # Per-planet phase curve params
     beam_val = params[idx] if fitbeam else 0.0
@@ -365,11 +459,15 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
         beam=beam_val, ellipsoidal=ellip_val,
         f0=f0_list, gamma=gamma_list,
         variance=variance_list, dilute=dilute_list, jittervar=jittervar_list,
+        slope=slope_val, quad=quad_val, rvepoch=rvepoch,
+        fitslope=fitslope, fitquad=fitquad,
         ttv=ttv_list, fitttv=fitttv, epoch_list=epoch_list,
         nstars=nstars, ntran=ntran, ntel=ntel, nbands=nbands,
         fitjittervar=fitjittervar, fitvariance=fitvariance, fitdilute=fitdilute,
         fitthermal=fitthermal, fitreflect=fitreflect,
         fitbeam=fitbeam, fitellip=fitellip,
+        tran_detrendadd=tran_detrendadd, tran_detrendmult=tran_detrendmult,
+        rv_detrendadd=rv_detrendadd, rv_detrendmult=rv_detrendmult,
     )
     return d
 
@@ -414,6 +512,14 @@ def check_bounds(d):
     # Per-transit bounds
     for f0 in d['f0']:
         if f0 <= 0:
+            return INF_CHI2
+
+    # Global RV trend bounds
+    if d.get('fitslope') or d.get('fitquad'):
+        if abs(d.get('slope', 0.0)) > 1e5:
+            return INF_CHI2
+    if d.get('fitquad'):
+        if abs(d.get('quad', 0.0)) > 1e5:
             return INF_CHI2
 
     # Per-transit dilution bounds: (-1, 1)
@@ -579,16 +685,39 @@ def chi2_transit(d, tran_data_list, e, omega, tran_addvar_list):
             tp_j = tc_to_tp(tc_j, d['period'], e, omega)
         else:
             tp_j = d['tp']
+        # Check if this transit has detrend covariates
+        tran_add_coeffs = d.get('tran_detrendadd', [])
+        tran_mult_coeffs = d.get('tran_detrendmult', [])
+        has_tran_detrend = (
+            (tran_add_coeffs and j < len(tran_add_coeffs) and tran_add_coeffs[j])
+            or (tran_mult_coeffs and j < len(tran_mult_coeffs) and tran_mult_coeffs[j])
+        )
+        # When detrending: pass f0=1.0 to get raw transit, apply F0 externally
+        tran_f0 = 1.0 if has_tran_detrend else f0_j
         try:
             model_flux = exozippy_tran(
                 tdata['bjd'], d['inc'], d['ar'], tp_j, d['period'],
-                e, omega, d['p'], u1_j, u2_j, f0_j,
+                e, omega, d['p'], u1_j, u2_j, tran_f0,
                 thermal=thermal_j, reflect=reflect_j,
                 beam=beam_j, ellipsoidal=ellip_j,
                 dilute=dilute_j, tc=d['tc'],
             )
         except Exception:
             return INF_CHI2
+        # Apply detrending: model = (transit + C*x) * (F0 + M*z)
+        if has_tran_detrend:
+            if tran_add_coeffs and j < len(tran_add_coeffs) and tran_add_coeffs[j]:
+                detrendadd = tdata.get('detrendadd')  # (nadd, npts)
+                if detrendadd is not None:
+                    coeffs = np.array(tran_add_coeffs[j])
+                    model_flux = model_flux + coeffs @ detrendadd
+            mult_term = f0_j
+            if tran_mult_coeffs and j < len(tran_mult_coeffs) and tran_mult_coeffs[j]:
+                detrendmult = tdata.get('detrendmult')  # (nmult, npts)
+                if detrendmult is not None:
+                    coeffs = np.array(tran_mult_coeffs[j])
+                    mult_term = mult_term + coeffs @ detrendmult
+            model_flux = model_flux * mult_term
         resid = tdata['flux'] - model_flux
         err2 = tdata['err']**2 + addvar_j
         val = np.sum(resid**2 / err2)
@@ -614,6 +743,10 @@ def chi2_rv(d, rv_data_list, e, omega, rv_jittervar_list):
         Per-telescope jitter variance.
     """
     total = 0.0
+    # Global RV trend params
+    slope_val = d.get('slope', 0.0) if (d.get('fitslope') or d.get('fitquad')) else None
+    quad_val = d.get('quad', 0.0) if d.get('fitquad') else None
+    rvepoch = d.get('rvepoch', 0.0)
     for j, rvdata in enumerate(rv_data_list):
         gamma_j = d['gamma'][j]
         # Use fitted jittervar if available, otherwise use fixed list
@@ -625,9 +758,23 @@ def chi2_rv(d, rv_data_list, e, omega, rv_jittervar_list):
             model_rv = exozippy_rv(
                 rvdata['bjd'], d['tp'], d['period'],
                 gamma_j, d['K'], e=e, omega=omega,
+                slope=slope_val, quad=quad_val, t0=rvepoch,
             )
         except Exception:
             return INF_CHI2
+        # Apply RV detrending: model = (rv + RVC*x) * (1 + RVM*z)
+        rv_add_coeffs = d.get('rv_detrendadd', [])
+        rv_mult_coeffs = d.get('rv_detrendmult', [])
+        if rv_add_coeffs and j < len(rv_add_coeffs) and rv_add_coeffs[j]:
+            detrendadd = rvdata.get('detrendadd')  # (nadd, npts)
+            if detrendadd is not None:
+                coeffs = np.array(rv_add_coeffs[j])
+                model_rv = model_rv + coeffs @ detrendadd
+        if rv_mult_coeffs and j < len(rv_mult_coeffs) and rv_mult_coeffs[j]:
+            detrendmult = rvdata.get('detrendmult')  # (nmult, npts)
+            if detrendmult is not None:
+                coeffs = np.array(rv_mult_coeffs[j])
+                model_rv = model_rv * (1.0 + coeffs @ detrendmult)
         resid = rvdata['vel'] - model_rv
         err2 = rvdata['err']**2 + jittervar_j
         val = np.sum(resid**2 / err2)
@@ -726,10 +873,13 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
                sed_data=None, nstars=1,
                ntran=1, ntel=1, nbands=1,
                circular=True, usevcve=False,
-               fitjittervar=False, fitvariance=False,
+               fitjittervar=False, fitslope=False, fitquad=False,
+               fitvariance=False,
                fitdilute=False, fitttv=False, epoch_list=None,
+               rvepoch=0.0,
                fitthermal=False, fitreflect=False,
-               fitbeam=False, fitellip=False):
+               fitbeam=False, fitellip=False,
+               detrend_info=None):
     """
     Total chi2 for the joint SED (+ optional MIST) + Transit + RV fit.
 
@@ -761,10 +911,13 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
                       priors=priors, nstars=nstars, has_sed=has_sed,
                       ntran=ntran, ntel=ntel, nbands=nbands,
                       circular=circular, usevcve=usevcve,
-                      fitjittervar=fitjittervar, fitvariance=fitvariance,
+                      fitjittervar=fitjittervar, fitslope=fitslope, fitquad=fitquad,
+                      fitvariance=fitvariance,
                       fitdilute=fitdilute, fitttv=fitttv, epoch_list=epoch_list,
+                      rvepoch=rvepoch,
                       fitthermal=fitthermal, fitreflect=fitreflect,
-                      fitbeam=fitbeam, fitellip=fitellip)
+                      fitbeam=fitbeam, fitellip=fitellip,
+                      detrend_info=detrend_info)
     if d is None:
         return INF_CHI2
 

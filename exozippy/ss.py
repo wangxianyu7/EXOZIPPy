@@ -43,6 +43,8 @@ class Star:
     av: Parameter = None
     distance: Parameter = None
     parallax: Parameter = None      # derived
+    slope: Parameter = None         # RV linear trend (m/s/day)
+    quad: Parameter = None          # RV quadratic trend (m/s/day^2)
     label: str = ''
     rootlabel: str = 'Stellar Parameters:'
 
@@ -115,6 +117,11 @@ class Transit:
     bjd: Optional[np.ndarray] = None
     flux: Optional[np.ndarray] = None
     err: Optional[np.ndarray] = None
+    # Detrending covariates (EXOFASTv2 style)
+    detrendadd: Optional[np.ndarray] = None      # (nadd, npts) normalized additive covariates
+    detrendmult: Optional[np.ndarray] = None     # (nmult, npts) normalized multiplicative covariates
+    detrendaddpars: list = field(default_factory=list)    # nadd fitted Parameters
+    detrendmultpars: list = field(default_factory=list)   # nmult fitted Parameters
     # Flags / indices
     epoch: int = 0                  # integer epoch from linear ephemeris
     bandndx: int = 0
@@ -136,6 +143,11 @@ class Telescope:
     bjd: Optional[np.ndarray] = None
     vel: Optional[np.ndarray] = None
     err: Optional[np.ndarray] = None
+    # Detrending covariates (EXOFASTv2 style)
+    detrendadd: Optional[np.ndarray] = None      # (nadd, npts) normalized additive covariates
+    detrendmult: Optional[np.ndarray] = None     # (nmult, npts) normalized multiplicative covariates
+    detrendaddpars: list = field(default_factory=list)    # nadd fitted Parameters
+    detrendmultpars: list = field(default_factory=list)   # nmult fitted Parameters
     name: str = ''
     label: str = ''
     rootlabel: str = 'Telescope Parameters:'
@@ -147,7 +159,7 @@ class Telescope:
 # Used by __getitem__ for backward-compatible dict access.
 _STAR_PARAMS = frozenset([
     'mstar', 'rstar', 'teff', 'feh', 'logg', 'lstar', 'rhostar',
-    'age', 'eep', 'av', 'distance', 'parallax',
+    'age', 'eep', 'av', 'distance', 'parallax', 'slope', 'quad',
 ])
 _PLANET_PARAMS = frozenset([
     'period', 'tc', 'p', 'cosi', 'K', 'e', 'omega',
@@ -169,6 +181,12 @@ _ALIASES = {
 
 # Regex for indexed parameter names like 'teff_1', 'mstar_0'
 _INDEXED_RE = re.compile(r'^(.+?)_(\d+)$')
+
+# Regex for detrend parameter names: C0_0, M1_2, RVC0_0, RVM1_1
+_DETREND_TRAN_ADD_RE = re.compile(r'^C(\d+)_(\d+)$')     # C{k}_{j} — transit j, covariate k
+_DETREND_TRAN_MULT_RE = re.compile(r'^M(\d+)_(\d+)$')    # M{k}_{j}
+_DETREND_RV_ADD_RE = re.compile(r'^RVC(\d+)_(\d+)$')     # RVC{k}_{j} — telescope j
+_DETREND_RV_MULT_RE = re.compile(r'^RVM(\d+)_(\d+)$')    # RVM{k}_{j}
 
 
 @dataclass
@@ -202,6 +220,9 @@ class SS:
     nplanets: int = 1
     use_mist: bool = False
     param_names: list = field(default_factory=list)
+
+    # Reference epochs
+    rvepoch: float = 0.0            # RV trend reference epoch (BJD)
 
     # Data paths
     sedfile: str = ''
@@ -280,10 +301,45 @@ class SS:
         'logmstar': 'mstar',
     }
 
+    def _resolve_detrend(self, key):
+        """Resolve detrend parameter names like C0_0, M1_2, RVC0_0, RVM1_1.
+
+        Returns (Parameter, True) if found, (None, False) otherwise.
+        """
+        m = _DETREND_TRAN_ADD_RE.match(key)
+        if m:
+            k, j = int(m.group(1)), int(m.group(2))
+            if j < len(self.transit) and k < len(self.transit[j].detrendaddpars):
+                return self.transit[j].detrendaddpars[k], True
+            return None, False
+        m = _DETREND_TRAN_MULT_RE.match(key)
+        if m:
+            k, j = int(m.group(1)), int(m.group(2))
+            if j < len(self.transit) and k < len(self.transit[j].detrendmultpars):
+                return self.transit[j].detrendmultpars[k], True
+            return None, False
+        m = _DETREND_RV_ADD_RE.match(key)
+        if m:
+            k, j = int(m.group(1)), int(m.group(2))
+            if j < len(self.telescope) and k < len(self.telescope[j].detrendaddpars):
+                return self.telescope[j].detrendaddpars[k], True
+            return None, False
+        m = _DETREND_RV_MULT_RE.match(key)
+        if m:
+            k, j = int(m.group(1)), int(m.group(2))
+            if j < len(self.telescope) and k < len(self.telescope[j].detrendmultpars):
+                return self.telescope[j].detrendmultpars[k], True
+            return None, False
+        return None, False
+
     def __getitem__(self, key):
         # Handle log-space params: logP → log10(period), logmstar → log10(mstar)
         if key in self._LOG_PARAMS:
             return np.log10(self[self._LOG_PARAMS[key]])
+        # Handle detrend params: C0_0, M0_0, RVC0_0, RVM0_0
+        par, found = self._resolve_detrend(key)
+        if found:
+            return par.value if par is not None else None
         obj, attr = self._resolve(key)
         val = getattr(obj, attr)
         if isinstance(val, Parameter):
@@ -295,6 +351,11 @@ class SS:
         if key in self._LOG_PARAMS:
             self[self._LOG_PARAMS[key]] = 10.0**value
             return
+        # Handle detrend params
+        par, found = self._resolve_detrend(key)
+        if found and par is not None:
+            par.value = value
+            return
         obj, attr = self._resolve(key)
         current = getattr(obj, attr)
         if isinstance(current, Parameter):
@@ -305,6 +366,9 @@ class SS:
     def __contains__(self, key):
         if key in self._LOG_PARAMS:
             return True
+        par, found = self._resolve_detrend(key)
+        if found:
+            return par is not None
         try:
             self._resolve(key)
             return True

@@ -98,6 +98,8 @@ def exozippy(
     fitbeam=False,
     fitellip=False,
     fitttv=False,
+    fitslope=False,
+    fitquad=False,
     novcve=False,
     verbose=True,
     **kwargs,
@@ -154,6 +156,7 @@ def exozippy(
 
     pc_kwargs = dict(fitjittervar=fitjittervar, fitvariance=fitvariance,
                      fitdilute=fitdilute, fitttv=fitttv,
+                     fitslope=fitslope, fitquad=fitquad,
                      fitthermal=fitthermal, fitreflect=fitreflect,
                      fitbeam=fitbeam, fitellip=fitellip,
                      usevcve=usevcve)
@@ -276,6 +279,8 @@ def _cli():
     parser.add_argument('--checkpoint-every', type=int, default=100, help='Checkpoint interval in steps (default: 100)')
     parser.add_argument('--ttv', action='store_true', help='Fit transit timing variations (requires >=3 transits)')
     parser.add_argument('--dilute', action='store_true', help='Fit per-transit dilution from contaminating flux')
+    parser.add_argument('--fitslope', action='store_true', help='Fit global RV linear trend (slope)')
+    parser.add_argument('--fitquad', action='store_true', help='Fit global RV quadratic trend (implies slope)')
     parser.add_argument('--novcve', action='store_true', help='Disable Vc/Ve eccentricity parameterization')
     parser.add_argument('--quiet', action='store_true', help='Reduce console output')
     args = parser.parse_args()
@@ -290,6 +295,8 @@ def _cli():
         nomist=args.nomist,
         fitdilute=args.dilute,
         fitttv=args.ttv,
+        fitslope=args.fitslope,
+        fitquad=args.fitquad,
         novcve=args.novcve,
         skipopt=args.skipopt,
         run_mcmc_flag=args.mcmc,

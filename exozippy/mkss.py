@@ -218,6 +218,14 @@ def _make_star(idx, priors, constants):
         parallax=_mkpar(f'parallax{suffix}', priors, initval=1000.0 / dist_init,
                          scale=100,
                          latex=r'\varpi', description='Parallax', unit='mas'),
+        slope=_mkpar('slope', priors, initval=0.0,
+                      scale=1.0,
+                      latex=r'\dot{\gamma}', description='RV slope',
+                      unit='m/s/day'),
+        quad=_mkpar('quad', priors, initval=0.0,
+                     scale=1.0,
+                     latex=r'\ddot{\gamma}', description='RV quadratic term',
+                     unit='m/s/day^2'),
         label=chr(65 + idx),  # 'A', 'B', 'C', ...
     )
 
@@ -361,14 +369,108 @@ def _make_band(name, idx, priors):
     )
 
 
+# ── Detrending helpers ───────────────────────────────────────────────
+
+def _parse_detrend_header(filename):
+    """Parse the first line of a data file for detrend column classification.
+
+    Returns (add_indices, mult_indices) — lists of column indices (0-based
+    from col 3 onward) that are additive vs multiplicative.
+
+    Convention (EXOFASTv2): header line starts with '#'; column names
+    prefixed with 'M' are multiplicative, others are additive.
+    If no header, all extra columns are additive.
+    """
+    add_indices = []
+    mult_indices = []
+    with open(filename, 'r') as f:
+        first_line = f.readline().strip()
+    if not first_line.startswith('#'):
+        return None, None  # no header — caller counts columns
+    names = first_line.lstrip('#').split()
+    # First 3 columns are BJD, FLUX/RV, ERR — skip them
+    for i, name in enumerate(names[3:]):
+        if name.upper().startswith('M'):
+            mult_indices.append(i)
+        else:
+            add_indices.append(i)
+    return add_indices, mult_indices
+
+
+def _normalize_covariates(array):
+    """Mean-subtract and scale to [-1, 1] (EXOFASTv2 convention).
+
+    Parameters
+    ----------
+    array : np.ndarray, shape (ncov, npts)
+
+    Returns
+    -------
+    np.ndarray, same shape, normalized.
+    """
+    if array.size == 0:
+        return array
+    arr = array.copy()
+    for i in range(arr.shape[0]):
+        arr[i] -= np.mean(arr[i])
+        mx = np.max(np.abs(arr[i]))
+        if mx > 0:
+            arr[i] /= mx
+    return arr
+
+
+def _read_data_with_detrend(filename):
+    """Read a data file and extract detrend covariates.
+
+    Returns
+    -------
+    bjd, col1, err : 1D arrays (columns 0, 1, 2)
+    detrendadd : (nadd, npts) normalized additive covariates or None
+    detrendmult : (nmult, npts) normalized multiplicative covariates or None
+    """
+    # Count header lines to skip for np.loadtxt
+    nheader = 0
+    with open(filename, 'r') as f:
+        for line in f:
+            if line.strip().startswith('#'):
+                nheader += 1
+            else:
+                break
+    data = np.loadtxt(filename, comments='#')
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+    bjd = data[:, 0]
+    col1 = data[:, 1]
+    err = data[:, 2]
+
+    ncol = data.shape[1]
+    if ncol <= 3:
+        return bjd, col1, err, None, None
+
+    # Extra columns present → parse header for add/mult classification
+    extras = data[:, 3:]  # (npts, nextra)
+    add_indices, mult_indices = _parse_detrend_header(filename)
+
+    if add_indices is None:
+        # No header → all extra columns are additive
+        detrendadd = _normalize_covariates(extras.T)  # (nextra, npts)
+        return bjd, col1, err, detrendadd, None
+
+    # Header present — split by classification
+    detrendadd = None
+    detrendmult = None
+    if add_indices:
+        detrendadd = _normalize_covariates(extras[:, add_indices].T)
+    if mult_indices:
+        detrendmult = _normalize_covariates(extras[:, mult_indices].T)
+    return bjd, col1, err, detrendadd, detrendmult
+
+
 # ── Build Transit ────────────────────────────────────────────────────
 
 def _make_transit(tranfile, idx, priors, tc=None, period=None, fitttv=False):
     """Build a Transit from a data file."""
-    data = np.loadtxt(tranfile, comments='#')
-    bjd = data[:, 0]
-    flux = data[:, 1]
-    err = data[:, 2]
+    bjd, flux, err, detrendadd, detrendmult = _read_data_with_detrend(tranfile)
 
     basename = os.path.basename(tranfile)
 
@@ -378,6 +480,24 @@ def _make_transit(tranfile, idx, priors, tc=None, period=None, fitttv=False):
         epoch = int(round((float(np.median(bjd)) - tc) / period))
 
     suffix = f'_{idx}'
+
+    # Create detrend parameters
+    detrendaddpars = []
+    if detrendadd is not None:
+        for k in range(detrendadd.shape[0]):
+            par = _mkpar(f'C{k}{suffix}', priors, initval=0.0, scale=0.1,
+                         latex=f'C_{{{k}}}', description=f'Additive detrend {k}',
+                         fit=True)
+            detrendaddpars.append(par)
+
+    detrendmultpars = []
+    if detrendmult is not None:
+        for k in range(detrendmult.shape[0]):
+            par = _mkpar(f'M{k}{suffix}', priors, initval=0.0, scale=0.1,
+                         latex=f'M_{{{k}}}', description=f'Multiplicative detrend {k}',
+                         fit=True)
+            detrendmultpars.append(par)
+
     return Transit(
         f0=_mkpar(f'f0{suffix}', priors, initval=float(np.median(flux)),
                    lower=0.0, upper=2.0, scale=0.001,
@@ -395,6 +515,10 @@ def _make_transit(tranfile, idx, priors, tc=None, period=None, fitttv=False):
         bjd=bjd,
         flux=flux,
         err=err,
+        detrendadd=detrendadd,
+        detrendmult=detrendmult,
+        detrendaddpars=detrendaddpars,
+        detrendmultpars=detrendmultpars,
         epoch=epoch,
         name=basename,
         label=basename,
@@ -405,10 +529,7 @@ def _make_transit(tranfile, idx, priors, tc=None, period=None, fitttv=False):
 
 def _make_telescope(rvfile, idx, priors):
     """Build a Telescope from an RV data file."""
-    data = np.loadtxt(rvfile, comments='#')
-    bjd = data[:, 0]
-    vel = data[:, 1]
-    err = data[:, 2]
+    bjd, vel, err, detrendadd, detrendmult = _read_data_with_detrend(rvfile)
 
     basename = os.path.basename(rvfile)
     label = (os.path.splitext(basename)[0].split('.')[1]
@@ -418,6 +539,23 @@ def _make_telescope(rvfile, idx, priors):
     gamma_init = _prior_val(priors, f'gamma{suffix}',
                              _prior_val(priors, 'gamma_0', 0.0))
     jittervar_init = _prior_val(priors, 'jittervar', 0.0)
+
+    # Create RV detrend parameters
+    detrendaddpars = []
+    if detrendadd is not None:
+        for k in range(detrendadd.shape[0]):
+            par = _mkpar(f'RVC{k}{suffix}', priors, initval=0.0, scale=1.0,
+                         latex=f'RVC_{{{k}}}', description=f'RV additive detrend {k}',
+                         unit='m/s', fit=True)
+            detrendaddpars.append(par)
+
+    detrendmultpars = []
+    if detrendmult is not None:
+        for k in range(detrendmult.shape[0]):
+            par = _mkpar(f'RVM{k}{suffix}', priors, initval=0.0, scale=1.0,
+                         latex=f'RVM_{{{k}}}', description=f'RV multiplicative detrend {k}',
+                         unit='', fit=True)
+            detrendmultpars.append(par)
 
     return Telescope(
         gamma=_mkpar(f'gamma{suffix}', priors, initval=gamma_init,
@@ -434,6 +572,10 @@ def _make_telescope(rvfile, idx, priors):
         bjd=bjd,
         vel=vel,
         err=err,
+        detrendadd=detrendadd,
+        detrendmult=detrendmult,
+        detrendaddpars=detrendaddpars,
+        detrendmultpars=detrendmultpars,
         name=basename,
         label=label,
     )
@@ -455,6 +597,8 @@ def mkss(
     circular=True,
     use_mist=False,
     fitjittervar=False,
+    fitslope=False,
+    fitquad=False,
     fitvariance=False,
     fitdilute=False,
     fitthermal=False,
@@ -580,6 +724,12 @@ def mkss(
     if _fitttv:
         for j in range(len(transits)):
             param_names.append(f'ttv_{j}')
+    # Per-transit detrending coefficients (auto-detected from extra columns)
+    for j, tr in enumerate(transits):
+        for k in range(len(tr.detrendaddpars)):
+            param_names.append(f'C{k}_{j}')
+        for k in range(len(tr.detrendmultpars)):
+            param_names.append(f'M{k}_{j}')
     # Per-telescope gamma
     for j in range(len(telescopes)):
         param_names.append(f'gamma_{j}')
@@ -587,6 +737,18 @@ def mkss(
     if fitjittervar:
         for j in range(len(telescopes)):
             param_names.append(f'jittervar_{j}')
+    # Per-telescope detrending coefficients (auto-detected from extra columns)
+    for j, tel in enumerate(telescopes):
+        for k in range(len(tel.detrendaddpars)):
+            param_names.append(f'RVC{k}_{j}')
+        for k in range(len(tel.detrendmultpars)):
+            param_names.append(f'RVM{k}_{j}')
+    # Global RV trend (fitquad implies fitslope)
+    _fitslope = fitslope or fitquad
+    if _fitslope:
+        param_names.append('slope')
+    if fitquad:
+        param_names.append('quad')
     # Per-planet phase curve params
     if fitbeam:
         param_names.append('beam')
@@ -594,6 +756,28 @@ def mkss(
         param_names.append('ellipsoidal')
 
     # ── Assemble SS ──
+
+    # Compute rvepoch and seed slope/quad from RV data
+    rvepoch = 0.0
+    if telescopes and (_fitslope or fitquad):
+        alltime = np.concatenate([t.bjd for t in telescopes])
+        allrv = np.concatenate([t.vel for t in telescopes])
+        rvepoch = (float(np.min(alltime)) + float(np.max(alltime))) / 2.0
+        if fitquad:
+            coeffs = np.polyfit(alltime - rvepoch, allrv, 2)
+            stars[0].quad.value = coeffs[0]
+            stars[0].slope.value = coeffs[1]
+            stars[0].quad.fit = True
+            stars[0].slope.fit = True
+            # Absorb constant into gammas
+            for tel in telescopes:
+                tel.gamma.value += coeffs[2] / len(telescopes)
+        elif _fitslope:
+            coeffs = np.polyfit(alltime - rvepoch, allrv, 1)
+            stars[0].slope.value = coeffs[0]
+            stars[0].slope.fit = True
+            for tel in telescopes:
+                tel.gamma.value += coeffs[1] / len(telescopes)
 
     ss = SS(
         star=stars,
@@ -606,6 +790,7 @@ def mkss(
         nplanets=nplanets,
         use_mist=use_mist,
         param_names=param_names,
+        rvepoch=rvepoch,
         sedfile=str(sedfile) if sedfile else '',
         tranpath=str(tranpath) if tranpath else '',
         rvpath=str(rvpath) if rvpath else '',
