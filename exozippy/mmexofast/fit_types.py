@@ -1,5 +1,5 @@
 """
-model_types.py
+fit_types.py
 
 Definitions of model-type enums, ModelKey, and label<->ModelKey conversion.
 
@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict
+from typing import Dict, Optional
 
 
 # ============================================================================
@@ -75,16 +75,17 @@ class LensOrbMotion(Enum):
 
 
 # ============================================================================
-# ModelKey
+# FitKey
 # ============================================================================
 
 
 @dataclass(frozen=True)
-class ModelKey:
+class FitKey:
     lens_type: LensType
     source_type: SourceType
     parallax_branch: ParallaxBranch
     lens_orb_motion: LensOrbMotion
+    locations_used: Optional[str] = None
 
     def __post_init__(self) -> None:
         # Enforce: point lens cannot have orbital motion.
@@ -132,7 +133,7 @@ LENS_MOTION_TAGS: Dict[str, LensOrbMotion] = {
 # ============================================================================
 
 
-def label_to_model_key(label: str) -> ModelKey:
+def label_to_model_key(label: str) -> FitKey:
     """
     Parse a human-readable label into a ModelKey.
 
@@ -151,7 +152,7 @@ def label_to_model_key(label: str) -> ModelKey:
 
     Returns
     -------
-    ModelKey
+    FitKey
 
     Raises
     ------
@@ -221,7 +222,7 @@ def label_to_model_key(label: str) -> ModelKey:
             f"Unknown base model tag in label {label!r}: {base!r}"
         )
 
-    return ModelKey(
+    return FitKey(
         lens_type=lens_type,
         source_type=source_type,
         parallax_branch=parallax_branch,
@@ -229,7 +230,7 @@ def label_to_model_key(label: str) -> ModelKey:
     )
 
 
-def model_key_to_label(key: ModelKey) -> str:
+def model_key_to_label(key: FitKey) -> str:
     """
     Map a ModelKey back to a human-readable label following the same
     conventions as label_to_model_key().
@@ -244,7 +245,7 @@ def model_key_to_label(key: ModelKey) -> str:
 
     Parameters
     ----------
-    key : ModelKey
+    key : FitKey
 
     Returns
     -------
