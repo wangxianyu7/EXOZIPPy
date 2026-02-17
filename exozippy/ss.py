@@ -45,6 +45,11 @@ class Star:
     parallax: Parameter = None      # derived
     slope: Parameter = None         # RV linear trend (m/s/day)
     quad: Parameter = None          # RV quadratic trend (m/s/day^2)
+    # Rossiter-McLaughlin line broadening (per star)
+    vgamma: Parameter = None        # Lorentzian line width (m/s)
+    vzeta: Parameter = None         # Macroturbulent velocity (m/s)
+    vxi: Parameter = None           # Microturbulent velocity (m/s)
+    valpha: Parameter = None        # Extra broadening (m/s)
     label: str = ''
     rootlabel: str = 'Stellar Parameters:'
 
@@ -81,10 +86,14 @@ class Planet:
     # Phase curve (per planet)
     beam: Parameter = None              # Doppler beaming amplitude [ppm]
     ellipsoidal: Parameter = None       # Ellipsoidal variation amplitude [ppm]
+    # Rossiter-McLaughlin (per planet)
+    svsinicoslam: Parameter = None      # sqrt(vsini)*cos(lambda), m/s^0.5
+    svsinisinlam: Parameter = None      # sqrt(vsini)*sin(lambda), m/s^0.5
     # Flags
     fittran: bool = True
     fitrv: bool = True
     circular: bool = True
+    rossiter: bool = False
     starndx: int = 0
     label: str = ''
     rootlabel: str = 'Planetary Parameters:'
@@ -148,6 +157,9 @@ class Telescope:
     detrendmult: Optional[np.ndarray] = None     # (nmult, npts) normalized multiplicative covariates
     detrendaddpars: list = field(default_factory=list)    # nadd fitted Parameters
     detrendmultpars: list = field(default_factory=list)   # nmult fitted Parameters
+    # Rossiter-McLaughlin
+    rmband: str = 'notrm'          # RM band name ('notrm' = no RM for this telescope)
+    rmbandndx: int = -1            # index into ss.bands[] for RM LD (-1 = no RM)
     name: str = ''
     label: str = ''
     rootlabel: str = 'Telescope Parameters:'
@@ -160,6 +172,7 @@ class Telescope:
 _STAR_PARAMS = frozenset([
     'mstar', 'rstar', 'teff', 'feh', 'logg', 'lstar', 'rhostar',
     'age', 'eep', 'av', 'distance', 'parallax', 'slope', 'quad',
+    'vgamma', 'vzeta', 'vxi', 'valpha',
 ])
 _PLANET_PARAMS = frozenset([
     'period', 'tc', 'p', 'cosi', 'K', 'e', 'omega',
@@ -168,6 +181,7 @@ _PLANET_PARAMS = frozenset([
     'ar', 'b', 'inc_rad', 'ideg', 'delta',
     'mp', 'rp', 'a', 'teq',
     'beam', 'ellipsoidal',
+    'svsinicoslam', 'svsinisinlam',
 ])
 _BAND_PARAMS = frozenset(['u1', 'u2', 'thermal', 'reflect'])
 _TRANSIT_PARAMS = frozenset(['f0', 'variance', 'dilute', 'tran_addvar', 'ttv'])

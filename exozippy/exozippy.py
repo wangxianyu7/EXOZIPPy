@@ -101,6 +101,8 @@ def exozippy(
     fitslope=False,
     fitquad=False,
     novcve=False,
+    rossiter=False,
+    rmbands=None,
     verbose=True,
     **kwargs,
 ):
@@ -159,6 +161,7 @@ def exozippy(
                      fitslope=fitslope, fitquad=fitquad,
                      fitthermal=fitthermal, fitreflect=fitreflect,
                      fitbeam=fitbeam, fitellip=fitellip,
+                     rossiter=rossiter, rmbands=rmbands,
                      usevcve=usevcve)
 
     # --- Stage 1: start (initial guess plots) ---
@@ -282,6 +285,9 @@ def _cli():
     parser.add_argument('--fitslope', action='store_true', help='Fit global RV linear trend (slope)')
     parser.add_argument('--fitquad', action='store_true', help='Fit global RV quadratic trend (implies slope)')
     parser.add_argument('--novcve', action='store_true', help='Disable Vc/Ve eccentricity parameterization')
+    parser.add_argument('--rm', action='store_true', help='Fit Rossiter-McLaughlin effect (Hirano 2011)')
+    parser.add_argument('--rmbands', type=str, default=None,
+                        help='Per-telescope RM band names, comma-separated (e.g. "notrm,V")')
     parser.add_argument('--quiet', action='store_true', help='Reduce console output')
     args = parser.parse_args()
 
@@ -298,6 +304,8 @@ def _cli():
         fitslope=args.fitslope,
         fitquad=args.fitquad,
         novcve=args.novcve,
+        rossiter=args.rm,
+        rmbands=args.rmbands.split(',') if args.rmbands else None,
         skipopt=args.skipopt,
         run_mcmc_flag=args.mcmc,
         mcmc_steps=args.steps,

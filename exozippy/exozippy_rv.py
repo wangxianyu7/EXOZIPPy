@@ -61,7 +61,9 @@ from . import exozippy_rossiter
 
 def exozippy_rv(bjd, tp, period, gamma, K, e=None, omega=None,
                slope=None, quad=None, t0=None, rossiter=False, i=None, a=None,
-               u1=None, p=None, vsini=None, _lambda=None, deltarv=None):
+               u1=None, u2=None, p=None, vsini=None, _lambda=None,
+               vgamma=None, vzeta=None, vxi=None, valpha=None,
+               deltarv=None):
 
     # Calculate the mean anomaly corresponding to each observed time
     meananom = 2.0 * np.pi * (1.0 + np.mod((bjd - tp)/period,1.0))
@@ -103,22 +105,22 @@ def exozippy_rv(bjd, tp, period, gamma, K, e=None, omega=None,
         if quad is not None:
             rv += (bjd - t0)**2 * quad
 
-    # Calculate the RM effect
+    # Calculate the RM effect (Hirano et al. 2011)
     if rossiter:
-        if i is None or a is None or u1 is None or p is None or vsini is None or _lambda is None:
-            raise ValueError('ERROR: a, i, u1, p, vsini, and _lambda must be specified '
+        if (i is None or a is None or u1 is None or p is None
+                or vsini is None or _lambda is None):
+            raise ValueError('ERROR: a, i, u1, u2, p, vsini, _lambda, '
+                             'vgamma, vzeta, vxi, valpha must be specified '
                              'to calculate the Rossiter McLaughlin effect')
-
-        # Calculate the corresponding (x,y) coordinates of the planet
-        r = a * (1 - e ** 2) / (1 + e * np.cos(trueanom))
-
-        # As seen from the observer
-        x = -r * np.cos(trueanom + omega)
-        tmp = r * np.sin(trueanom + omega)
-        y = -tmp * np.cos(i)
-        z = tmp * np.sin(i)
-
-        exozippy_rossiter.exozippy_rossiter(x, y, u1, p, vsini, _lambda, deltarv, z=z)
+        _u2 = u2 if u2 is not None else 0.0
+        _vgamma = vgamma if vgamma is not None else 1000.0
+        _vzeta = vzeta if vzeta is not None else 4000.0
+        _vxi = vxi if vxi is not None else 1000.0
+        _valpha = valpha if valpha is not None else 0.0
+        deltarv = exozippy_rossiter.exozippy_rossiter(
+            bjd, tp, period, e0, omega0, i, a, p, u1, _u2,
+            vsini, _lambda, _vgamma, _vzeta, _vxi, _valpha,
+        )
         rv += deltarv
 
     return rv

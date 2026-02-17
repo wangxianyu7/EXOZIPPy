@@ -59,6 +59,8 @@ _DILUTE_SCALE = 0.01                   # per transit, dilution fraction
 _TTV_SCALE = 0.02                      # per transit, days (~30 min)
 _DETREND_TRAN_SCALE = 0.1              # per transit detrend coeff
 _DETREND_RV_SCALE = 1.0                # per telescope detrend coeff
+_SVSINI_SCALE = 100.0                  # svsinicoslam, svsinisinlam (m/s^0.5)
+_VLINE_SCALE = 1000.0                  # vgamma, vzeta, vxi, valpha (m/s)
 
 # Legacy single-instrument constants (for backward compat imports)
 BASE_PLANET_PARAMS = [
@@ -85,6 +87,7 @@ def param_names(use_mist: bool, nstars: int = 1, has_sed: bool = True,
                 fitdilute: bool = False, fitttv: bool = False,
                 fitthermal: bool = False, fitreflect: bool = False,
                 fitbeam: bool = False, fitellip: bool = False,
+                rossiter: bool = False,
                 detrend_info: dict = None):
     """Return the ordered parameter name list.
 
@@ -96,6 +99,7 @@ def param_names(use_mist: bool, nstars: int = 1, has_sed: bool = True,
             [per-telescope gamma] [per-telescope jittervar?]
             [per-telescope detrend?]
             [slope?] [quad?] [beam?] [ellipsoidal?]
+            [RM: svsinicoslam svsinisinlam vgamma vzeta vxi valpha?]
     """
     stellar = BASE_STELLAR_PARAMS if has_sed else NOSED_STELLAR_PARAMS
     names = []
@@ -169,6 +173,9 @@ def param_names(use_mist: bool, nstars: int = 1, has_sed: bool = True,
         names.append('beam')
     if fitellip:
         names.append('ellipsoidal')
+    if rossiter:
+        names.extend(['svsinicoslam', 'svsinisinlam',
+                       'vgamma', 'vzeta', 'vxi', 'valpha'])
     return names
 
 
@@ -181,6 +188,7 @@ def param_scales(use_mist: bool, nstars: int = 1, has_sed: bool = True,
                  fitdilute: bool = False, fitttv: bool = False,
                  fitthermal: bool = False, fitreflect: bool = False,
                  fitbeam: bool = False, fitellip: bool = False,
+                 rossiter: bool = False,
                  detrend_info: dict = None):
     """Return scales matching param_names ordering.
 
@@ -247,6 +255,9 @@ def param_scales(use_mist: bool, nstars: int = 1, has_sed: bool = True,
         scales.append(np.array([_BEAM_SCALE]))
     if fitellip:
         scales.append(np.array([_ELLIP_SCALE]))
+    if rossiter:
+        scales.append(np.array([_SVSINI_SCALE, _SVSINI_SCALE,
+                                 _VLINE_SCALE, _VLINE_SCALE, _VLINE_SCALE, _VLINE_SCALE]))
     return np.concatenate(scales)
 
 
@@ -263,6 +274,7 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
                   rvepoch=0.0,
                   fitthermal=False, fitreflect=False,
                   fitbeam=False, fitellip=False,
+                  rossiter=False,
                   detrend_info=None):
     """
     Unpack the flat parameter vector into a named dict.
@@ -446,6 +458,25 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
     if fitellip:
         idx += 1
 
+    # Rossiter-McLaughlin params
+    svsinicoslam_val = 0.0
+    svsinisinlam_val = 0.0
+    vgamma_val = 1000.0
+    vzeta_val = 4000.0
+    vxi_val = 1000.0
+    valpha_val = 0.0
+    vsini_val = 0.0
+    lam_val = 0.0
+    if rossiter:
+        svsinicoslam_val = params[idx]; idx += 1
+        svsinisinlam_val = params[idx]; idx += 1
+        vgamma_val = params[idx]; idx += 1
+        vzeta_val = params[idx]; idx += 1
+        vxi_val = params[idx]; idx += 1
+        valpha_val = params[idx]; idx += 1
+        vsini_val = svsinicoslam_val**2 + svsinisinlam_val**2
+        lam_val = np.arctan2(svsinisinlam_val, svsinicoslam_val)
+
     d = dict(
         mstar=mstar_arr, age=age_arr,
         teff=teff_arr, rstar=rstar_arr, feh=feh_arr,
@@ -468,6 +499,10 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
         fitbeam=fitbeam, fitellip=fitellip,
         tran_detrendadd=tran_detrendadd, tran_detrendmult=tran_detrendmult,
         rv_detrendadd=rv_detrendadd, rv_detrendmult=rv_detrendmult,
+        rossiter=rossiter,
+        svsinicoslam=svsinicoslam_val, svsinisinlam=svsinisinlam_val,
+        vsini=vsini_val, lam=lam_val,
+        vgamma=vgamma_val, vzeta=vzeta_val, vxi=vxi_val, valpha=valpha_val,
     )
     return d
 
@@ -534,6 +569,13 @@ def check_bounds(d):
         for ttv_j in d['ttv']:
             if abs(ttv_j) >= half_period:
                 return INF_CHI2
+
+    # RM bounds
+    if d.get('rossiter'):
+        if d['vsini'] < 0:
+            return INF_CHI2
+        if d['vgamma'] < 0 or d['vzeta'] < 0 or d['vxi'] < 0 or d['valpha'] < 0:
+            return INF_CHI2
 
     # Per-band limb darkening (Kipping 2013)
     for j in range(len(d['u1'])):
@@ -730,7 +772,7 @@ def chi2_transit(d, tran_data_list, e, omega, tran_addvar_list):
 # ---------------------------------------------------------------------------
 # 7. RV chi2 (loops over all telescopes)
 # ---------------------------------------------------------------------------
-def chi2_rv(d, rv_data_list, e, omega, rv_jittervar_list):
+def chi2_rv(d, rv_data_list, e, omega, rv_jittervar_list, rmbandndx_list=None):
     """
     Radial-velocity chi2, summed over all telescopes.
 
@@ -741,6 +783,8 @@ def chi2_rv(d, rv_data_list, e, omega, rv_jittervar_list):
         Each dict has keys: bjd, vel, err.
     rv_jittervar_list : list[float]
         Per-telescope jitter variance.
+    rmbandndx_list : list[int] or None
+        Per-telescope RM band index (-1 = no RM).
     """
     total = 0.0
     # Global RV trend params
@@ -754,12 +798,30 @@ def chi2_rv(d, rv_data_list, e, omega, rv_jittervar_list):
             jittervar_j = d['jittervar'][j]
         else:
             jittervar_j = rv_jittervar_list[j] if j < len(rv_jittervar_list) else 0.0
+        # Check if this telescope has RM
+        has_rm = (d.get('rossiter') and rmbandndx_list is not None
+                  and j < len(rmbandndx_list) and rmbandndx_list[j] >= 0)
         try:
-            model_rv = exozippy_rv(
-                rvdata['bjd'], d['tp'], d['period'],
-                gamma_j, d['K'], e=e, omega=omega,
-                slope=slope_val, quad=quad_val, t0=rvepoch,
-            )
+            if has_rm:
+                bandndx = rmbandndx_list[j]
+                u1_rm = d['u1'][bandndx]
+                u2_rm = d['u2'][bandndx]
+                model_rv = exozippy_rv(
+                    rvdata['bjd'], d['tp'], d['period'],
+                    gamma_j, d['K'], e=e, omega=omega,
+                    slope=slope_val, quad=quad_val, t0=rvepoch,
+                    rossiter=True, i=d['inc'], a=d['ar'],
+                    u1=u1_rm, u2=u2_rm, p=d['p'],
+                    vsini=d['vsini'], _lambda=d['lam'],
+                    vgamma=d['vgamma'], vzeta=d['vzeta'],
+                    vxi=d['vxi'], valpha=d['valpha'],
+                )
+            else:
+                model_rv = exozippy_rv(
+                    rvdata['bjd'], d['tp'], d['period'],
+                    gamma_j, d['K'], e=e, omega=omega,
+                    slope=slope_val, quad=quad_val, t0=rvepoch,
+                )
         except Exception:
             return INF_CHI2
         # Apply RV detrending: model = (rv + RVC*x) * (1 + RVM*z)
@@ -879,6 +941,7 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
                rvepoch=0.0,
                fitthermal=False, fitreflect=False,
                fitbeam=False, fitellip=False,
+               rossiter=False, rmbandndx_list=None,
                detrend_info=None):
     """
     Total chi2 for the joint SED (+ optional MIST) + Transit + RV fit.
@@ -917,6 +980,7 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
                       rvepoch=rvepoch,
                       fitthermal=fitthermal, fitreflect=fitreflect,
                       fitbeam=fitbeam, fitellip=fitellip,
+                      rossiter=rossiter,
                       detrend_info=detrend_info)
     if d is None:
         return INF_CHI2
@@ -958,7 +1022,8 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
 
     # 7. RV (all telescopes)
     if rv_data_list:
-        val = chi2_rv(d, rv_data_list, e_val, omega_val, rv_jittervar_list)
+        val = chi2_rv(d, rv_data_list, e_val, omega_val, rv_jittervar_list,
+                      rmbandndx_list=rmbandndx_list)
         if val >= INF_CHI2:
             return INF_CHI2
         total += val

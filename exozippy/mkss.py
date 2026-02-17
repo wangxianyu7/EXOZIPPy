@@ -226,6 +226,22 @@ def _make_star(idx, priors, constants):
                      scale=1.0,
                      latex=r'\ddot{\gamma}', description='RV quadratic term',
                      unit='m/s/day^2'),
+        vgamma=_mkpar('vgamma', priors, initval=_prior_val(priors, 'vgamma', 1000.0),
+                        lower=0.0, upper=1e5, scale=1000.0,
+                        latex=r'v_{\gamma}', description='Lorentzian line width',
+                        unit='m/s'),
+        vzeta=_mkpar('vzeta', priors, initval=_prior_val(priors, 'vzeta', 4000.0),
+                       lower=0.0, upper=1e5, scale=1000.0,
+                       latex=r'v_{\zeta}', description='Macroturbulent velocity',
+                       unit='m/s'),
+        vxi=_mkpar('vxi', priors, initval=_prior_val(priors, 'vxi', 1000.0),
+                     lower=0.0, upper=1e5, scale=1000.0,
+                     latex=r'v_{\xi}', description='Microturbulent velocity',
+                     unit='m/s'),
+        valpha=_mkpar('valpha', priors, initval=_prior_val(priors, 'valpha', 0.0),
+                        lower=0.0, upper=1e5, scale=1000.0,
+                        latex=r'v_{\alpha}', description='Extra broadening',
+                        unit='m/s'),
         label=chr(65 + idx),  # 'A', 'B', 'C', ...
     )
 
@@ -337,6 +353,16 @@ def _make_planet(idx, priors, constants, circular=True, fittran=True, fitrv=True
         ellipsoidal=_mkpar('ellipsoidal', priors, initval=_prior_val(priors, 'ellipsoidal', 0.0),
                             lower=0.0, upper=500, scale=5.0,
                             latex=r'A_{\rm ellip}', description='Ellipsoidal variation amplitude', unit='ppm'),
+        svsinicoslam=_mkpar('svsinicoslam', priors,
+                             initval=_prior_val(priors, 'svsinicoslam', 0.0),
+                             lower=-1e4, upper=1e4, scale=100.0,
+                             latex=r'\sqrt{v\sin{i}}\cos{\lambda}',
+                             description='sqrt(vsini)*cos(lambda)', unit='m^{0.5}/s^{0.5}'),
+        svsinisinlam=_mkpar('svsinisinlam', priors,
+                              initval=_prior_val(priors, 'svsinisinlam', 0.0),
+                              lower=-1e4, upper=1e4, scale=100.0,
+                              latex=r'\sqrt{v\sin{i}}\sin{\lambda}',
+                              description='sqrt(vsini)*sin(lambda)', unit='m^{0.5}/s^{0.5}'),
         fittran=fittran,
         fitrv=fitrv,
         circular=circular,
@@ -607,6 +633,8 @@ def mkss(
     fitellip=False,
     usevcve=False,
     fitttv=False,
+    rossiter=False,
+    rmbands=None,
 ):
     """
     Construct a Stellar System (SS) structure.
@@ -754,6 +782,33 @@ def mkss(
         param_names.append('beam')
     if fitellip:
         param_names.append('ellipsoidal')
+    # Rossiter-McLaughlin params (per-planet + per-star)
+    if rossiter:
+        param_names.extend(['svsinicoslam', 'svsinisinlam'])
+        param_names.extend(['vgamma', 'vzeta', 'vxi', 'valpha'])
+        for pl in planets:
+            pl.rossiter = True
+            pl.svsinicoslam.fit = True
+            pl.svsinisinlam.fit = True
+        for s in stars:
+            s.vgamma.fit = True
+            s.vzeta.fit = True
+            s.vxi.fit = True
+            s.valpha.fit = True
+    # Assign rmbands to telescopes
+    if rmbands is not None:
+        for j, tel in enumerate(telescopes):
+            if j < len(rmbands):
+                tel.rmband = rmbands[j]
+                if rmbands[j] != 'notrm':
+                    # Find band index by name
+                    for bi, b in enumerate(bands):
+                        if b.name == rmbands[j]:
+                            tel.rmbandndx = bi
+                            break
+                    else:
+                        # If not found, use band 0 (default)
+                        tel.rmbandndx = 0
 
     # ── Assemble SS ──
 

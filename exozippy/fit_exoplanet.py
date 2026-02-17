@@ -44,6 +44,7 @@ def _mcmc_log_posterior(theta, tran_data_list, rv_data_list, sedfile, priors,
                         rvepoch=0.0,
                         fitthermal=False, fitreflect=False,
                         fitbeam=False, fitellip=False,
+                        rossiter=False, rmbandndx_list=None,
                         detrend_info=None):
     """Module-level log-posterior for picklability with multiprocessing."""
     chi2 = joint_chi2(theta, tran_data_list, rv_data_list, sedfile, priors,
@@ -61,6 +62,7 @@ def _mcmc_log_posterior(theta, tran_data_list, rv_data_list, sedfile, priors,
                       rvepoch=rvepoch,
                       fitthermal=fitthermal, fitreflect=fitreflect,
                       fitbeam=fitbeam, fitellip=fitellip,
+                      rossiter=rossiter, rmbandndx_list=rmbandndx_list,
                       detrend_info=detrend_info)
     if not np.isfinite(chi2) or chi2 > 1e9:
         return -np.inf
@@ -157,7 +159,8 @@ def build_initial_guess(priorfile, tranfile, rvfile, e=0.0,
                         fitdilute=False, fitttv=False,
                         fitslope=False, fitquad=False,
                         fitthermal=False, fitreflect=False,
-                        fitbeam=False, fitellip=False):
+                        fitbeam=False, fitellip=False,
+                        rossiter=False, rmbands=None):
     """
     Construct an SS object from priors (before optimization).
     """
@@ -174,6 +177,7 @@ def build_initial_guess(priorfile, tranfile, rvfile, e=0.0,
         fitslope=fitslope, fitquad=fitquad,
         fitthermal=fitthermal, fitreflect=fitreflect,
         fitbeam=fitbeam, fitellip=fitellip,
+        rossiter=rossiter, rmbands=rmbands,
     )
     ss.planet[0].e.value = e
     ss.planet[0].omega.value = omega
@@ -221,7 +225,8 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
                   fitdilute=False, fitttv=False,
                   fitslope=False, fitquad=False,
                   fitthermal=False, fitreflect=False,
-                  fitbeam=False, fitellip=False):
+                  fitbeam=False, fitellip=False,
+                  rossiter=False, rmbands=None):
     """
     Joint fit of SED (+ optional MIST evolutionary prior) + Transit + RV data.
 
@@ -279,6 +284,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
                           fitslope=fitslope, fitquad=fitquad,
                           fitthermal=fitthermal, fitreflect=fitreflect,
                           fitbeam=fitbeam, fitellip=fitellip,
+                          rossiter=rossiter,
                           detrend_info=detrend_info)
 
     # Per-instrument jittervar/variance from priors
@@ -301,8 +307,14 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
         fitslope=fitslope, fitquad=fitquad,
         fitthermal=fitthermal, fitreflect=fitreflect,
         fitbeam=fitbeam, fitellip=fitellip,
+        rossiter=rossiter, rmbands=rmbands,
     )
     rvepoch = ss.rvepoch
+
+    # Build rmbandndx_list for chi2_rv
+    rmbandndx_list = None
+    if rossiter:
+        rmbandndx_list = [tel.rmbandndx for tel in ss.telescope]
     ss.planet[0].e.value = e
     ss.planet[0].omega.value = omega
     sqrte = np.sqrt(e)
@@ -351,6 +363,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
             fitslope=fitslope, fitquad=fitquad, rvepoch=rvepoch,
             fitthermal=fitthermal, fitreflect=fitreflect,
             fitbeam=fitbeam, fitellip=fitellip,
+            rossiter=rossiter, rmbandndx_list=rmbandndx_list,
             detrend_info=detrend_info)
         _log(f"Initial chi2     : {chi2_init:.2f}", verbose)
 
@@ -369,6 +382,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
                               fitslope=fitslope, fitquad=fitquad,
                               fitthermal=fitthermal, fitreflect=fitreflect,
                               fitbeam=fitbeam, fitellip=fitellip,
+                              rossiter=rossiter,
                               detrend_info=detrend_info)
 
     def _chi2_func(params):
@@ -386,6 +400,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
             fitslope=fitslope, fitquad=fitquad, rvepoch=rvepoch,
             fitthermal=fitthermal, fitreflect=fitreflect,
             fitbeam=fitbeam, fitellip=fitellip,
+            rossiter=rossiter, rmbandndx_list=rmbandndx_list,
             detrend_info=detrend_info)
 
     if verbose:
@@ -507,6 +522,16 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
         bounds.append((-500.0, 500.0))         # beam can be positive or negative
     if fitellip:
         bounds.append((0.0, 500.0))            # ellipsoidal >= 0
+    # Rossiter-McLaughlin bounds
+    if rossiter:
+        bounds.extend([
+            (-1e4, 1e4),                           # svsinicoslam
+            (-1e4, 1e4),                           # svsinisinlam
+            (0.0, 1e5),                            # vgamma
+            (0.0, 1e5),                            # vzeta
+            (0.0, 1e5),                            # vxi
+            (0.0, 1e5),                            # valpha
+        ])
 
     if verbose:
         _log('Starting L-BFGS-B refinement...', verbose)
@@ -619,7 +644,8 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
              fitdilute=False, fitttv=False,
              fitslope=False, fitquad=False,
              fitthermal=False, fitreflect=False,
-             fitbeam=False, fitellip=False):
+             fitbeam=False, fitellip=False,
+             rossiter=False, rmbands=None):
     """Run DEMC-PT MCMC sampling around the best-fit joint solution."""
     from exozippy.sed.utils import read_sed_file
 
@@ -665,16 +691,23 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
                                 fitdilute=fitdilute, fitttv=_fitttv,
                                 fitslope=fitslope, fitquad=fitquad,
                                 fitthermal=fitthermal, fitreflect=fitreflect,
-                                fitbeam=fitbeam, fitellip=fitellip)
+                                fitbeam=fitbeam, fitellip=fitellip,
+                                rossiter=rossiter, rmbands=rmbands)
 
     # Get rvepoch from bestfit SS
     rvepoch = bestfit.rvepoch if isinstance(bestfit, SS) else 0.0
+
+    # Build rmbandndx_list from bestfit SS
+    rmbandndx_list = None
+    if rossiter and isinstance(bestfit, SS):
+        rmbandndx_list = [tel.rmbandndx for tel in bestfit.telescope]
 
     pc_kwargs = dict(fitjittervar=fitjittervar, fitvariance=fitvariance,
                      fitdilute=fitdilute, fitttv=_fitttv,
                      fitslope=fitslope, fitquad=fitquad,
                      fitthermal=fitthermal, fitreflect=fitreflect,
                      fitbeam=fitbeam, fitellip=fitellip,
+                     rossiter=rossiter,
                      usevcve=usevcve)
     pnames = bestfit.param_names if isinstance(bestfit, SS) else (bestfit.get('param_names') or _param_names(use_mist, nstars=nstars, has_sed=has_sed, ntran=ntran, ntel=ntel, nbands=nbands, circular=circular, detrend_info=detrend_info, **pc_kwargs))
     name_to_idx = {name: i for i, name in enumerate(pnames)}
@@ -704,7 +737,8 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
         age_prior=age_prior, nstars=nstars,
         ntran=ntran, ntel=ntel, nbands=nbands,
         circular=circular, epoch_list=epoch_list,
-        rvepoch=rvepoch, detrend_info=detrend_info,
+        rvepoch=rvepoch, rmbandndx_list=rmbandndx_list,
+        detrend_info=detrend_info,
         **pc_kwargs,
     )
 
@@ -781,6 +815,7 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
             use_mist=use_mist,
             nstars=nstars,
             circular=circular,
+            rmbands=rmbands,
             **pc_kwargs,
         )
         _update_ss_from_params(bestfit_mcmc, map_params, pnames, e, omega)
