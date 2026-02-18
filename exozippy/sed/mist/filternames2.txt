@@ -138,8 +138,8 @@ Unsupported Swift_UVW1 Unsupported Unsupported
 Unsupported Swift_UVW2 Unsupported Unsupported
 Unsupported Swift_V Unsupported Unsupported
 Unsupported TESS TESS Unsupported
-BT Tycho_B Unsupported Unsupported
-VT Tycho_V Unsupported Unsupported
+BT Tycho_B Unsupported Tycho/Tycho.B
+VT Tycho_V Unsupported Tycho/Tycho.V
 Unsupported UKIDSS_H Unsupported Unsupported
 Unsupported UKIDSS_J Unsupported Unsupported
 Unsupported UKIDSS_K Unsupported Unsupported

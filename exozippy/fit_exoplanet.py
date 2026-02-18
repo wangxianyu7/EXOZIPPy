@@ -26,7 +26,7 @@ from exozippy.exozippy_chi2 import (
     derive_ar as _derive_ar,
     BASE_PARAM_NAMES, BASE_SCALES,
 )
-from exozippy.mkss import mkss, _parse_priors, _read_data_with_detrend
+from exozippy.mkss import mkss, _parse_priors, _read_data_with_detrend, _get_band_info
 from exozippy.ss import SS
 
 # Keep backward-compatible alias
@@ -45,6 +45,8 @@ def _mcmc_log_posterior(theta, tran_data_list, rv_data_list, sedfile, priors,
                         fitthermal=False, fitreflect=False,
                         fitbeam=False, fitellip=False,
                         rossiter=False, rmbandndx_list=None,
+                        fitdt=False, fiterrscale=False,
+                        dt_data_list=None, dtbandndx_list=None,
                         detrend_info=None):
     """Module-level log-posterior for picklability with multiprocessing."""
     chi2 = joint_chi2(theta, tran_data_list, rv_data_list, sedfile, priors,
@@ -63,6 +65,8 @@ def _mcmc_log_posterior(theta, tran_data_list, rv_data_list, sedfile, priors,
                       fitthermal=fitthermal, fitreflect=fitreflect,
                       fitbeam=fitbeam, fitellip=fitellip,
                       rossiter=rossiter, rmbandndx_list=rmbandndx_list,
+                      fitdt=fitdt, fiterrscale=fiterrscale,
+                      dt_data_list=dt_data_list, dtbandndx_list=dtbandndx_list,
                       detrend_info=detrend_info)
     if not np.isfinite(chi2) or chi2 > 1e9:
         return -np.inf
@@ -136,6 +140,16 @@ def read_all_rv_data(rvpath):
     return [read_rv_data(f) for f in files], files
 
 
+def read_all_dt_data(dtpath):
+    """Read all Doppler Tomography FITS files matching a glob pattern.
+
+    Returns (list[dict], list[str]) — data dicts and file paths.
+    """
+    from exozippy.exozippy_dopptom import read_dt_fits
+    files = sorted(_glob.glob(str(dtpath)))
+    return [read_dt_fits(f) for f in files], files
+
+
 def _build_detrend_info(tran_data_list, rv_data_list):
     """Build detrend_info dict from data lists. Returns None if no detrending."""
     tran_nadd = [td.get('detrendadd', np.empty((0, 0))).shape[0] if td.get('detrendadd') is not None else 0
@@ -160,7 +174,8 @@ def build_initial_guess(priorfile, tranfile, rvfile, e=0.0,
                         fitslope=False, fitquad=False,
                         fitthermal=False, fitreflect=False,
                         fitbeam=False, fitellip=False,
-                        rossiter=False, rmbands=None):
+                        rossiter=False, rmbands=None,
+                        dtpath=None, fitdt=False, fiterrscale=False):
     """
     Construct an SS object from priors (before optimization).
     """
@@ -226,7 +241,9 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
                   fitslope=False, fitquad=False,
                   fitthermal=False, fitreflect=False,
                   fitbeam=False, fitellip=False,
-                  rossiter=False, rmbands=None):
+                  rossiter=False, rmbands=None,
+                  dtpath=None, fitdt=False, fiterrscale=False,
+                  rmbands_dt=None):
     """
     Joint fit of SED (+ optional MIST evolutionary prior) + Transit + RV data.
 
@@ -257,9 +274,24 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
     mstar_prior = priors.get('mstar', {}).get('value', 1.0)
     age_prior = priors.get('age', {}).get('value', 1.0)
 
+    # Doppler Tomography data
+    dt_data_list, dtfiles = (read_all_dt_data(dtpath) if dtpath else ([], []))
+    _fitdt = fitdt and bool(dt_data_list)
+    ndt = len(dt_data_list)
+    # dtbandndx_list: per-DT-file band index for limb darkening (default all → 0)
+    dtbandndx_list = [0] * ndt
+
     ntran = len(tran_data_list)
     ntel = len(rv_data_list)
-    nbands = 1  # for now, single band
+
+    # Assign per-transit band index from filenames (EXOFASTv2 convention)
+    if tranfiles:
+        _, tran_bandndx = _get_band_info(tranfiles)
+        for td, bi in zip(tran_data_list, tran_bandndx):
+            td['bandndx'] = bi
+        nbands = len(set(tran_bandndx))
+    else:
+        nbands = 1
 
     # Compute detrend_info from data files (auto-detected extra columns)
     detrend_info = _build_detrend_info(tran_data_list, rv_data_list)
@@ -285,6 +317,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
                           fitthermal=fitthermal, fitreflect=fitreflect,
                           fitbeam=fitbeam, fitellip=fitellip,
                           rossiter=rossiter,
+                          fitdt=_fitdt, ndt=ndt, fiterrscale=fiterrscale,
                           detrend_info=detrend_info)
 
     # Per-instrument jittervar/variance from priors
@@ -308,6 +341,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
         fitthermal=fitthermal, fitreflect=fitreflect,
         fitbeam=fitbeam, fitellip=fitellip,
         rossiter=rossiter, rmbands=rmbands,
+        dtpath=dtpath, fitdt=_fitdt, fiterrscale=fiterrscale,
     )
     rvepoch = ss.rvepoch
 
@@ -342,7 +376,8 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
         _log("Starting parameters:", verbose)
         _log(f"  Teff={ss['teff']:.0f}K  Rstar={ss['rstar']:.3f}  [Fe/H]={ss['feh']:.3f}  Av={ss['av']:.3f}  dist={ss['distance']:.1f}", verbose)
         _log(f"  tc={ss['tc']:.5f}  P={ss['period']:.6f}  p={ss['p']:.4f}  cosi={ss['cosi']:.4f}", verbose)
-        _log(f"  u1_0={ss['u1_0']:.2f}  u2_0={ss['u2_0']:.2f}", verbose)
+        for _bi, _bnd in enumerate(ss.band):
+            _log(f"  u1_{_bi}={ss[f'u1_{_bi}']:.2f}  u2_{_bi}={ss[f'u2_{_bi}']:.2f}  [{_bnd.name}]", verbose)
         for j in range(ntran):
             _log(f"  f0_{j}={ss[f'f0_{j}']:.5f}", verbose)
         _log(f"  K={ss['K']:.1f}", verbose)
@@ -364,6 +399,8 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
             fitthermal=fitthermal, fitreflect=fitreflect,
             fitbeam=fitbeam, fitellip=fitellip,
             rossiter=rossiter, rmbandndx_list=rmbandndx_list,
+            fitdt=_fitdt, fiterrscale=fiterrscale,
+            dt_data_list=dt_data_list, dtbandndx_list=dtbandndx_list,
             detrend_info=detrend_info)
         _log(f"Initial chi2     : {chi2_init:.2f}", verbose)
 
@@ -383,6 +420,7 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
                               fitthermal=fitthermal, fitreflect=fitreflect,
                               fitbeam=fitbeam, fitellip=fitellip,
                               rossiter=rossiter,
+                              fitdt=_fitdt, ndt=ndt, fiterrscale=fiterrscale,
                               detrend_info=detrend_info)
 
     def _chi2_func(params):
@@ -401,10 +439,13 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
             fitthermal=fitthermal, fitreflect=fitreflect,
             fitbeam=fitbeam, fitellip=fitellip,
             rossiter=rossiter, rmbandndx_list=rmbandndx_list,
+            fitdt=_fitdt, fiterrscale=fiterrscale,
+            dt_data_list=dt_data_list, dtbandndx_list=dtbandndx_list,
             detrend_info=detrend_info)
 
     if verbose:
         _log('Starting Amoeba (Nelder-Mead) search...', verbose)
+
     amoeba_sol, amoeba_chi2, amoeba_info = amoeba(
         _chi2_func, x0=x0, scale=scale_vec,
         ftol=1e-6, maxiter=50000, verbose=verbose)
@@ -532,6 +573,17 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
             (0.0, 1e5),                            # vxi
             (0.0, 1e5),                            # valpha
         ])
+    # Doppler Tomography bounds
+    if _fitdt:
+        if not rossiter:
+            bounds.extend([
+                (-1e4, 1e4),                       # svsinicoslam
+                (-1e4, 1e4),                       # svsinisinlam
+            ])
+        bounds.append((1.0, 1e5))                  # vline (m/s, must be > 0)
+        if fiterrscale:
+            for _ in range(ndt):
+                bounds.append((0.01, 100.0))       # errscale_j
 
     if verbose:
         _log('Starting L-BFGS-B refinement...', verbose)
@@ -552,6 +604,8 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
 
     # Update SS from optimized parameters
     _update_ss_from_params(ss, res.x, pnames, e, omega)
+    ss.param_names = pnames          # full list including detrend params
+    ss.opt_params  = res.x.copy()   # full optimizer solution vector
 
     # Fit diagnostics
     nsed = len(sed_data['mag']) if sed_data is not None else 0
@@ -588,9 +642,9 @@ def fit_exoplanet(priorfile, tranfile, rvfile, sedfile, e=0.0,
         _log(f"cosi     = {ss['cosi']:.4f} (i = {ss['ideg']:.2f} deg)", verbose)
         _log(f"a/Rs     = {ss['ar']:.2f}", verbose)
         _log(f"b        = {ss['b']:.4f}", verbose)
-        for j in range(nbands):
-            _log(f"u1_{j}     = {ss[f'u1_{j}']:.4f}", verbose)
-            _log(f"u2_{j}     = {ss[f'u2_{j}']:.4f}", verbose)
+        for j, _bnd in enumerate(ss.band):
+            _log(f"u1_{j} [{_bnd.name:8s}] = {ss[f'u1_{j}']:.4f}", verbose)
+            _log(f"u2_{j} [{_bnd.name:8s}] = {ss[f'u2_{j}']:.4f}", verbose)
         for j in range(ntran):
             _log(f"f0_{j}     = {ss[f'f0_{j}']:.5f}", verbose)
         _log('---', verbose)
@@ -645,7 +699,8 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
              fitslope=False, fitquad=False,
              fitthermal=False, fitreflect=False,
              fitbeam=False, fitellip=False,
-             rossiter=False, rmbands=None):
+             rossiter=False, rmbands=None,
+             dtpath=None, fitdt=False, fiterrscale=False):
     """Run DEMC-PT MCMC sampling around the best-fit joint solution."""
     from exozippy.sed.utils import read_sed_file
 
@@ -657,9 +712,21 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
     mstar_prior = priors.get('mstar', {}).get('value', 1.0)
     age_prior = priors.get('age', {}).get('value', 1.0)
 
+    dt_data_list, _ = (read_all_dt_data(dtpath) if dtpath else ([], []))
+    _fitdt = fitdt and bool(dt_data_list)
+    ndt = len(dt_data_list)
+    dtbandndx_list = [0] * ndt
+
     ntran = len(tran_data_list)
     ntel = len(rv_data_list)
-    nbands = 1
+
+    if tranfiles:
+        _, tran_bandndx = _get_band_info(tranfiles)
+        for td, bi in zip(tran_data_list, tran_bandndx):
+            td['bandndx'] = bi
+        nbands = len(set(tran_bandndx))
+    else:
+        nbands = 1
 
     # Compute detrend_info from data files
     detrend_info = _build_detrend_info(tran_data_list, rv_data_list)
@@ -692,7 +759,9 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
                                 fitslope=fitslope, fitquad=fitquad,
                                 fitthermal=fitthermal, fitreflect=fitreflect,
                                 fitbeam=fitbeam, fitellip=fitellip,
-                                rossiter=rossiter, rmbands=rmbands)
+                                rossiter=rossiter, rmbands=rmbands,
+                                dtpath=dtpath, fitdt=_fitdt,
+                                fiterrscale=fiterrscale)
 
     # Get rvepoch from bestfit SS
     rvepoch = bestfit.rvepoch if isinstance(bestfit, SS) else 0.0
@@ -708,8 +777,9 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
                      fitthermal=fitthermal, fitreflect=fitreflect,
                      fitbeam=fitbeam, fitellip=fitellip,
                      rossiter=rossiter,
+                     fitdt=_fitdt, fiterrscale=fiterrscale,
                      usevcve=usevcve)
-    pnames = bestfit.param_names if isinstance(bestfit, SS) else (bestfit.get('param_names') or _param_names(use_mist, nstars=nstars, has_sed=has_sed, ntran=ntran, ntel=ntel, nbands=nbands, circular=circular, detrend_info=detrend_info, **pc_kwargs))
+    pnames = bestfit.param_names if isinstance(bestfit, SS) else (bestfit.get('param_names') or _param_names(use_mist, nstars=nstars, has_sed=has_sed, ntran=ntran, ntel=ntel, nbands=nbands, circular=circular, ndt=ndt, detrend_info=detrend_info, **pc_kwargs))
     name_to_idx = {name: i for i, name in enumerate(pnames)}
     x_best = np.array([bestfit[n] for n in pnames])
     ndim = len(x_best)
@@ -721,7 +791,7 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
     scales = _param_scales(use_mist, nstars=nstars, has_sed=has_sed,
                            ntran=ntran, ntel=ntel, nbands=nbands,
                            circular=circular, ar_init=ar_init,
-                           detrend_info=detrend_info, **pc_kwargs)
+                           ndt=ndt, detrend_info=detrend_info, **pc_kwargs)
 
     if verbose:
         print(f"=== DEMC-PT: {nchains} chains, {ntemps} temps, {nsteps} steps ===")
@@ -738,6 +808,7 @@ def run_mcmc(priorfile, tranfile, rvfile, sedfile, bestfit=None,
         ntran=ntran, ntel=ntel, nbands=nbands,
         circular=circular, epoch_list=epoch_list,
         rvepoch=rvepoch, rmbandndx_list=rmbandndx_list,
+        dt_data_list=dt_data_list, dtbandndx_list=dtbandndx_list,
         detrend_info=detrend_info,
         **pc_kwargs,
     )

@@ -212,14 +212,119 @@ def _load_bc_cube(bc_path: str):
 
 @functools.lru_cache(maxsize=256)
 def _load_filter_curve(idl_path: str):
-    """Read and cache a filter transmission curve and metadata."""
-    filt = readsav(idl_path, python_dict=True)['filter']
-    transmission = filt['transmission'][0]
-    weff = filt['weff'][0]
-    widtheff = filt['widtheff'][0]
-    zero_point = filt['zero_point'][0]
+    """Read and cache a filter transmission curve and metadata.
+
+    Accepts both IDL save (.idl) and numpy archive (.npz) formats.
+    The .npz format stores the same fields as the IDL struct:
+      weff, widtheff, zero_point, transmission  (all scalar/1-D float64).
+    """
+    if idl_path.endswith('.npz'):
+        d = np.load(idl_path)
+        transmission = d['transmission'].astype(np.float64)
+        weff       = float(d['weff'])
+        widtheff   = float(d['widtheff'])
+        zero_point = float(d['zero_point'])
+    else:
+        filt = readsav(idl_path, python_dict=True)['filter']
+        transmission = filt['transmission'][0]
+        weff       = filt['weff'][0]
+        widtheff   = filt['widtheff'][0]
+        zero_point = filt['zero_point'][0]
     curve_sum = np.sum(transmission)
     return transmission, weff, widtheff, zero_point, curve_sum
+
+
+def getfilter(filterid, root_dir=None, redo=False):
+    """Download a filter transmission curve from the SVO and save as .npz.
+
+    Replicates EXOFASTv2's getfilter.pro logic.
+    The file is saved as <filterid with / -> _>.npz in the filtercurves directory.
+
+    Parameters
+    ----------
+    filterid : str
+        SVO filter ID, e.g. 'Tycho/Tycho.B'.
+    root_dir : str or None
+        EXOZIPPy module root.  Defaults to exozippy.MODULE_PATH.
+    redo : bool
+        Re-download even if file exists.
+    """
+    import urllib.request, xml.etree.ElementTree as ET
+    if root_dir is None:
+        root_dir = exozippy.MODULE_PATH
+    outdir = pathlib.Path(root_dir) / 'sed' / 'filtercurves'
+    npzname = filterid.replace('/', '_') + '.npz'
+    npzpath = outdir / npzname
+    if npzpath.exists() and not redo:
+        return str(npzpath)
+
+    # --- download SVO XML ---
+    url = f'http://svo2.cab.inta-csic.es/theory/fps3/fps.php?ID={filterid}'
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'EXOZIPPy/1.0'})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            xml_bytes = r.read()
+    except Exception as exc:
+        print(f'getfilter: download failed for {filterid}: {exc}')
+        return None
+
+    # --- parse WavelengthEff, WidthEff, ZeroPoint and transmission table ---
+    C_MICRON_S = 2.99792458e14   # speed of light in µm/s
+    weff_ang = widtheff_ang = zp_jy = None
+    wavelengths, transmissions = [], []
+
+    root = ET.fromstring(xml_bytes)
+    ns = {'v': root.tag.split('}')[0].lstrip('{') if '}' in root.tag else ''}
+    # walk all elements
+    in_table = False
+    td_vals = []
+    for elem in root.iter():
+        tag = elem.tag.split('}')[-1]
+        name = elem.get('name', '')
+        if tag == 'PARAM':
+            if name == 'WavelengthEff':
+                weff_ang = float(elem.get('value'))
+            elif name == 'WidthEff':
+                widtheff_ang = float(elem.get('value'))
+            elif name == 'ZeroPoint':
+                zp_jy = float(elem.get('value'))
+        elif tag == 'TD':
+            if elem.text:
+                td_vals.append(float(elem.text))
+
+    # TD values come in pairs: wavelength(Å), transmission
+    for k in range(0, len(td_vals) - 1, 2):
+        wavelengths.append(td_vals[k])
+        transmissions.append(td_vals[k+1])
+
+    if weff_ang is None or zp_jy is None or len(wavelengths) < 2:
+        print(f'getfilter: could not parse SVO data for {filterid}')
+        return None
+
+    # --- convert to microns and interpolate onto 24000-pt grid ---
+    wave_um  = np.array(wavelengths)  / 1e4   # Å → µm
+    trans    = np.array(transmissions)
+    intwave  = np.arange(24000) / 1000.0 + 0.1  # 0.100 … 24.099 µm
+
+    # pad outside measured range with zeros
+    wave_full = np.concatenate([intwave[intwave < wave_um[0]],
+                                wave_um,
+                                intwave[intwave > wave_um[-1]]])
+    tran_full = np.concatenate([np.zeros(np.sum(intwave < wave_um[0])),
+                                trans,
+                                np.zeros(np.sum(intwave > wave_um[-1]))])
+    inttran = np.interp(intwave, wave_full, tran_full)
+
+    weff_um     = weff_ang     / 1e4
+    widtheff_um = widtheff_ang / 1e4
+    # zero_point: Jy → erg/s/cm²  (matching EXOFASTv2: 1e-23 * zp_jy * c / weff)
+    zero_point  = 1e-23 * zp_jy * C_MICRON_S / weff_um
+
+    np.savez(npzpath,
+             weff=weff_um, widtheff=widtheff_um,
+             zero_point=zero_point, transmission=inttran)
+    print(f'getfilter: saved {npzpath}')
+    return str(npzpath)
 
 @functools.lru_cache(maxsize=4)
 def _load_filter_names(root_dir: str):
@@ -528,28 +633,38 @@ def read_sed_file(
         mag[i] = float(entries[1])
         errmag[i] = float(entries[2])
 
-        # Attempt to load filter curve
-        idlfile = filepath(sedbands[i] + '.idl', root_dir, ['sed', 'filtercurves'])
+        # Attempt to load filter curve (.idl or .npz)
+        def _find_filter(name):
+            """Return path to existing .idl or .npz file, or None."""
+            for ext in ('.idl', '.npz'):
+                p = filepath(name + ext, root_dir, ['sed', 'filtercurves'])
+                if os.path.isfile(p):
+                    return p
+            return None
 
-        if not os.path.isfile(idlfile):
+        idlfile = _find_filter(sedbands[i])
+
+        if idlfile is None:
+            # Try mapping via filternames2.txt
+            svo_id = None
             match = np.where(keivanname == sedbands[i])[0]
             if match.size == 1:
-                if svoname[match[0]] == 'Unsupported':
-                    printandlog(f'{sedbands[i]} is unsupported; try using the SVO name', logname)
-                    continue
-                idlfile = filepath(svoname[match[0]] + '.idl', root_dir,  ['sed', 'filtercurves'])
+                svo_id = svoname[match[0]]
             else:
                 match = np.where(mistname == sedbands[i])[0]
                 if match.size == 1:
-                    if svoname[match[0]] == 'Unsupported':
-                        printandlog(f'{sedbands[i]} is unsupported; try using the SVO name', logname)
-                        continue
-                    idlfile = filepath(svoname[match[0]] + '.idl', root_dir,  ['sed', 'filtercurves'])
+                    svo_id = svoname[match[0]]
 
-        if not os.path.isfile(idlfile) and download_new:
-            getfilter(sedbands[i])  # needs implementation
+            if svo_id and svo_id != 'Unsupported':
+                idlfile = _find_filter(svo_id.replace('/', '_'))
 
-        if not os.path.isfile(idlfile):
+            if idlfile is None and svo_id and svo_id != 'Unsupported':
+                # Try to download from SVO
+                result = getfilter(svo_id, root_dir=root_dir)
+                if result:
+                    idlfile = result
+
+        if idlfile is None:
             printandlog(f'band="{sedbands[i]}" in SED file not recognized; skipping', logname)
             errmag[i] = 99.0
             continue

@@ -50,6 +50,8 @@ class Star:
     vzeta: Parameter = None         # Macroturbulent velocity (m/s)
     vxi: Parameter = None           # Microturbulent velocity (m/s)
     valpha: Parameter = None        # Extra broadening (m/s)
+    # Doppler Tomography line broadening (per star)
+    vline: Parameter = None         # Intrinsic spectral line broadening sigma (m/s)
     label: str = ''
     rootlabel: str = 'Stellar Parameters:'
 
@@ -165,6 +167,27 @@ class Telescope:
     rootlabel: str = 'Telescope Parameters:'
 
 
+# ── DopplerTomography (per DT observation) ───────────────────────────
+
+@dataclass
+class DopplerTomography:
+    """Per-DT-file data and nuisance parameters.
+
+    Data arrays are loaded from the FITS file by ``read_dt_fits``.
+    ``errscale`` multiplies the per-pixel noise ``rms`` in the chi2.
+    """
+    ccf2d: Optional[np.ndarray] = None    # (ntime, nvel)  residual 2-D CCF
+    bjd: Optional[np.ndarray] = None      # (ntime,)  BJD mid-exposure times
+    vel: Optional[np.ndarray] = None      # (nvel,)   velocity axis (km/s)
+    rms: float = 1.0                      # per-pixel noise estimate
+    Rspec: float = 44000.0                # spectrograph resolving power
+    errscale: Parameter = None            # multiplicative error scale (default 1.0)
+    planet_idx: int = 0
+    label: str = ''
+    filename: str = ''
+    rootlabel: str = 'Doppler Tomography Parameters:'
+
+
 # ── SS (Stellar System — top level) ──────────────────────────────────
 
 # Parameter names that live on each sub-structure.
@@ -172,7 +195,7 @@ class Telescope:
 _STAR_PARAMS = frozenset([
     'mstar', 'rstar', 'teff', 'feh', 'logg', 'lstar', 'rhostar',
     'age', 'eep', 'av', 'distance', 'parallax', 'slope', 'quad',
-    'vgamma', 'vzeta', 'vxi', 'valpha',
+    'vgamma', 'vzeta', 'vxi', 'valpha', 'vline',
 ])
 _PLANET_PARAMS = frozenset([
     'period', 'tc', 'p', 'cosi', 'K', 'e', 'omega',
@@ -186,6 +209,7 @@ _PLANET_PARAMS = frozenset([
 _BAND_PARAMS = frozenset(['u1', 'u2', 'thermal', 'reflect'])
 _TRANSIT_PARAMS = frozenset(['f0', 'variance', 'dilute', 'tran_addvar', 'ttv'])
 _TELESCOPE_PARAMS = frozenset(['gamma', 'jittervar', 'jitter', 'rv_jittervar'])
+_DOPPTOM_PARAMS   = frozenset(['errscale'])
 
 # Aliases for backward compatibility with the old bestfit dict
 _ALIASES = {
@@ -227,6 +251,7 @@ class SS:
     band: List[Band] = field(default_factory=list)
     transit: List[Transit] = field(default_factory=list)
     telescope: List[Telescope] = field(default_factory=list)
+    dopptom: List[DopplerTomography] = field(default_factory=list)
     constants: dict = field(default_factory=dict)
 
     # Configuration
@@ -286,6 +311,8 @@ class SS:
                 return self.transit[idx], base
             if base in _TELESCOPE_PARAMS and idx < len(self.telescope):
                 return self.telescope[idx], base
+            if base in _DOPPTOM_PARAMS and idx < len(self.dopptom):
+                return self.dopptom[idx], base
             # Check alias with index (e.g. 'rv_jittervar_0')
             if base in _ALIASES:
                 container_name, real_attr = _ALIASES[base]
@@ -304,6 +331,8 @@ class SS:
             return self.transit[0], key
         if key in _TELESCOPE_PARAMS and self.telescope:
             return self.telescope[0], key
+        if key in _DOPPTOM_PARAMS and self.dopptom:
+            return self.dopptom[0], key
         # SS-level attributes
         if hasattr(self, key):
             return self, key

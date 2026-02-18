@@ -103,6 +103,9 @@ def exozippy(
     novcve=False,
     rossiter=False,
     rmbands=None,
+    dtpath=None,
+    fitdt=False,
+    fiterrscale=False,
     verbose=True,
     **kwargs,
 ):
@@ -162,6 +165,7 @@ def exozippy(
                      fitthermal=fitthermal, fitreflect=fitreflect,
                      fitbeam=fitbeam, fitellip=fitellip,
                      rossiter=rossiter, rmbands=rmbands,
+                     dtpath=dtpath, fitdt=fitdt, fiterrscale=fiterrscale,
                      usevcve=usevcve)
 
     # --- Stage 1: start (initial guess plots) ---
@@ -288,6 +292,11 @@ def _cli():
     parser.add_argument('--rm', action='store_true', help='Fit Rossiter-McLaughlin effect (Hirano 2011)')
     parser.add_argument('--rmbands', type=str, default=None,
                         help='Per-telescope RM band names, comma-separated (e.g. "notrm,V")')
+    parser.add_argument('--dt', type=str, default=None,
+                        help='Glob pattern for Doppler Tomography FITS files (e.g. "kelt17/DT/*.fits")')
+    parser.add_argument('--fitdt', action='store_true', help='Include Doppler Tomography chi2')
+    parser.add_argument('--fiterrscale', action='store_true',
+                        help='Fit per-DT-file multiplicative error scale')
     parser.add_argument('--quiet', action='store_true', help='Reduce console output')
     args = parser.parse_args()
 
@@ -306,6 +315,9 @@ def _cli():
         novcve=args.novcve,
         rossiter=args.rm,
         rmbands=args.rmbands.split(',') if args.rmbands else None,
+        dtpath=args.dt,
+        fitdt=args.fitdt or bool(args.dt),
+        fiterrscale=args.fiterrscale,
         skipopt=args.skipopt,
         run_mcmc_flag=args.mcmc,
         mcmc_steps=args.steps,

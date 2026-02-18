@@ -88,6 +88,7 @@ def param_names(use_mist: bool, nstars: int = 1, has_sed: bool = True,
                 fitthermal: bool = False, fitreflect: bool = False,
                 fitbeam: bool = False, fitellip: bool = False,
                 rossiter: bool = False,
+                fitdt: bool = False, ndt: int = 0, fiterrscale: bool = False,
                 detrend_info: dict = None):
     """Return the ordered parameter name list.
 
@@ -100,6 +101,7 @@ def param_names(use_mist: bool, nstars: int = 1, has_sed: bool = True,
             [per-telescope detrend?]
             [slope?] [quad?] [beam?] [ellipsoidal?]
             [RM: svsinicoslam svsinisinlam vgamma vzeta vxi valpha?]
+            [DT: svsinicoslam? svsinisinlam? vline errscale_j?]
     """
     stellar = BASE_STELLAR_PARAMS if has_sed else NOSED_STELLAR_PARAMS
     names = []
@@ -176,6 +178,14 @@ def param_names(use_mist: bool, nstars: int = 1, has_sed: bool = True,
     if rossiter:
         names.extend(['svsinicoslam', 'svsinisinlam',
                        'vgamma', 'vzeta', 'vxi', 'valpha'])
+    if fitdt:
+        # svsinicoslam/svsinisinlam shared with RM if rossiter=True
+        if not rossiter:
+            names.extend(['svsinicoslam', 'svsinisinlam'])
+        names.append('vline')
+        if fiterrscale:
+            for j in range(ndt):
+                names.append(f'errscale_{j}')
     return names
 
 
@@ -189,6 +199,7 @@ def param_scales(use_mist: bool, nstars: int = 1, has_sed: bool = True,
                  fitthermal: bool = False, fitreflect: bool = False,
                  fitbeam: bool = False, fitellip: bool = False,
                  rossiter: bool = False,
+                 fitdt: bool = False, ndt: int = 0, fiterrscale: bool = False,
                  detrend_info: dict = None):
     """Return scales matching param_names ordering.
 
@@ -258,6 +269,12 @@ def param_scales(use_mist: bool, nstars: int = 1, has_sed: bool = True,
     if rossiter:
         scales.append(np.array([_SVSINI_SCALE, _SVSINI_SCALE,
                                  _VLINE_SCALE, _VLINE_SCALE, _VLINE_SCALE, _VLINE_SCALE]))
+    if fitdt:
+        if not rossiter:
+            scales.append(np.array([_SVSINI_SCALE, _SVSINI_SCALE]))
+        scales.append(np.array([_VLINE_SCALE]))
+        if fiterrscale:
+            scales.append(np.full(ndt, 0.1))    # errscale scale ~ 0.1
     return np.concatenate(scales)
 
 
@@ -275,6 +292,7 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
                   fitthermal=False, fitreflect=False,
                   fitbeam=False, fitellip=False,
                   rossiter=False,
+                  fitdt=False, ndt=0, fiterrscale=False,
                   detrend_info=None):
     """
     Unpack the flat parameter vector into a named dict.
@@ -477,6 +495,20 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
         vsini_val = svsinicoslam_val**2 + svsinisinlam_val**2
         lam_val = np.arctan2(svsinisinlam_val, svsinicoslam_val)
 
+    # Doppler Tomography params
+    vline_val = 5000.0   # default intrinsic line broadening (m/s)
+    errscale_list = []
+    if fitdt:
+        if not rossiter:
+            svsinicoslam_val = params[idx]; idx += 1
+            svsinisinlam_val = params[idx]; idx += 1
+            vsini_val = svsinicoslam_val**2 + svsinisinlam_val**2
+            lam_val   = np.arctan2(svsinisinlam_val, svsinicoslam_val)
+        vline_val = params[idx]; idx += 1
+        if fiterrscale:
+            for j in range(ndt):
+                errscale_list.append(params[idx]); idx += 1
+
     d = dict(
         mstar=mstar_arr, age=age_arr,
         teff=teff_arr, rstar=rstar_arr, feh=feh_arr,
@@ -503,6 +535,8 @@ def unpack_params(params, use_mist=False, mstar_fixed=None, age_prior=None,
         svsinicoslam=svsinicoslam_val, svsinisinlam=svsinisinlam_val,
         vsini=vsini_val, lam=lam_val,
         vgamma=vgamma_val, vzeta=vzeta_val, vxi=vxi_val, valpha=valpha_val,
+        fitdt=fitdt, fiterrscale=fiterrscale,
+        vline=vline_val, errscale=errscale_list,
     )
     return d
 
@@ -576,6 +610,17 @@ def check_bounds(d):
             return INF_CHI2
         if d['vgamma'] < 0 or d['vzeta'] < 0 or d['vxi'] < 0 or d['valpha'] < 0:
             return INF_CHI2
+
+    # DT bounds
+    if d.get('fitdt'):
+        if d.get('vsini', 1.0) < 0:
+            return INF_CHI2
+        if d.get('vline', 1.0) <= 0:
+            return INF_CHI2
+        if d.get('fiterrscale') and d.get('errscale'):
+            for es in d['errscale']:
+                if es <= 0:
+                    return INF_CHI2
 
     # Per-band limb darkening (Kipping 2013)
     for j in range(len(d['u1'])):
@@ -847,7 +892,50 @@ def chi2_rv(d, rv_data_list, e, omega, rv_jittervar_list, rmbandndx_list=None):
 
 
 # ---------------------------------------------------------------------------
-# 8. Prior chi2
+# 8. Doppler Tomography chi2
+# ---------------------------------------------------------------------------
+def chi2_dt(d, dt_data_list, dtbandndx_list=None):
+    """
+    Doppler Tomography chi2, summed over all DT files.
+
+    Parameters
+    ----------
+    d : dict
+        Unpacked parameter dict from ``unpack_params``.
+    dt_data_list : list[dict]
+        Each dict is the output of ``read_dt_fits()``.
+    dtbandndx_list : list[int] or None
+        Per-DT-file LD band index (default: 0 for all).
+    """
+    from .exozippy_dopptom import chi2_dopptom
+    total = 0.0
+    errscale_list = d.get('errscale', [])
+    vsini_kms = d['vsini'] / 1000.0          # m/s → km/s
+    vline_kms = d.get('vline', 5000.0) / 1000.0  # m/s → km/s
+    for j, dt_data in enumerate(dt_data_list):
+        bandndx = (dtbandndx_list[j]
+                   if dtbandndx_list is not None and j < len(dtbandndx_list)
+                   else 0)
+        u1_j = d['u1'][bandndx] if d['u1'] else 0.4
+        u2_j = d['u2'][bandndx] if d['u2'] else 0.2
+        errscale_j = errscale_list[j] if j < len(errscale_list) else 1.0
+        try:
+            val = chi2_dopptom(
+                dt_data, d['tp'], d['period'], d['e'], d['omega'],
+                d['inc'], d['ar'], d['p'], d['lam'],
+                vsini_kms, vline_kms, u1_j, u2_j,
+                errscale=errscale_j,
+            )
+        except Exception:
+            return INF_CHI2
+        if not np.isfinite(val):
+            return INF_CHI2
+        total += val
+    return total
+
+
+# ---------------------------------------------------------------------------
+# 9. Prior chi2
 # ---------------------------------------------------------------------------
 def chi2_priors(d, priors, use_mist=False, nstars=1):
     """Gaussian prior chi2 penalties + hard bounds."""
@@ -942,9 +1030,11 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
                fitthermal=False, fitreflect=False,
                fitbeam=False, fitellip=False,
                rossiter=False, rmbandndx_list=None,
+               fitdt=False, fiterrscale=False,
+               dt_data_list=None, dtbandndx_list=None,
                detrend_info=None):
     """
-    Total chi2 for the joint SED (+ optional MIST) + Transit + RV fit.
+    Total chi2 for the joint SED (+ optional MIST) + Transit + RV (+ optional DT) fit.
 
     Parameters
     ----------
@@ -961,6 +1051,14 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
     tran_addvar_list : list[float] or None
         Per-transit added variance.
     ntran, ntel, nbands : int
+    fitdt : bool
+        Include Doppler Tomography chi2.
+    fiterrscale : bool
+        Fit per-DT-file error scale.
+    dt_data_list : list[dict] or None
+        Per-DT-file dicts from ``read_dt_fits()``.
+    dtbandndx_list : list[int] or None
+        Per-DT-file LD band index.
     """
     if rv_jittervar_list is None:
         rv_jittervar_list = [0.0] * ntel
@@ -968,6 +1066,7 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
         tran_addvar_list = [0.0] * ntran
 
     has_sed = sedfile is not None
+    ndt = len(dt_data_list) if dt_data_list else 0
     # 1. Unpack
     d = unpack_params(params, use_mist=use_mist,
                       mstar_fixed=mstar_fixed, age_prior=age_prior,
@@ -981,6 +1080,7 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
                       fitthermal=fitthermal, fitreflect=fitreflect,
                       fitbeam=fitbeam, fitellip=fitellip,
                       rossiter=rossiter,
+                      fitdt=fitdt, ndt=ndt, fiterrscale=fiterrscale,
                       detrend_info=detrend_info)
     if d is None:
         return INF_CHI2
@@ -1028,7 +1128,14 @@ def joint_chi2(params, tran_data_list, rv_data_list, sedfile, priors,
             return INF_CHI2
         total += val
 
-    # 8. Priors
+    # 8. Doppler Tomography (all DT files)
+    if fitdt and dt_data_list:
+        val = chi2_dt(d, dt_data_list, dtbandndx_list=dtbandndx_list)
+        if val >= INF_CHI2:
+            return INF_CHI2
+        total += val
+
+    # 9. Priors
     total += chi2_priors(d, priors, use_mist, nstars=nstars)
 
     return total

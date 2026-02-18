@@ -17,7 +17,47 @@ import numpy as np
 
 from .mkconstants import mkconstants
 from .parameter import Parameter
-from .ss import SS, Star, Planet, Band, Transit, Telescope
+from .ss import SS, Star, Planet, Band, Transit, Telescope, DopplerTomography
+
+
+# ── Band name parsing (EXOFASTv2 convention) ─────────────────────────
+
+# Single-letter Sloan aliases → canonical names (same as EXOFASTv2 readtran.pro)
+_SLOAN_ALIASES = {
+    'u': 'Sloanu', 'g': 'Sloang', 'r': 'Sloanr',
+    'i': 'Sloani', 'z': 'Sloanz',
+}
+
+
+def _parse_band_name(filename):
+    """
+    Extract and normalize the filter/band name from a transit filename.
+
+    EXOFASTv2 convention: nYYYYMMDD.FILTER.TELESCOPE.whateveryouwant
+    The band name is the second dot-separated field of the basename.
+    Single-letter Sloan aliases (g, r, i, z, u) are expanded to their
+    canonical names (Sloang, Sloanr, etc.).
+    """
+    parts = os.path.basename(filename).split('.')
+    name = parts[1] if len(parts) > 1 else 'default'
+    return _SLOAN_ALIASES.get(name, name)
+
+
+def _get_band_info(tranfiles):
+    """
+    Parse band names from a list of transit filenames.
+
+    Returns
+    -------
+    unique_bands : list[str]
+        Sorted unique band names (alphabetical, same as EXOFASTv2).
+    bandndx : list[int]
+        Per-transit index into ``unique_bands``.
+    """
+    names = [_parse_band_name(f) for f in tranfiles]
+    unique_bands = sorted(set(names))
+    bandndx = [unique_bands.index(n) for n in names]
+    return unique_bands, bandndx
 
 
 # ── Helper: parse a prior file ────────────────────────────────────────
@@ -93,6 +133,27 @@ def _parse_priors(parfile):
                             'lower': np.nan, 'upper': np.nan}
         priors['secosw'] = {'value': sqrte * _math.cos(omega_val), 'sigma': 0.0,
                             'lower': np.nan, 'upper': np.nan}
+
+    # RM prior name aliases: EXOFASTv2 uses the long form "lambda" suffix
+    # but our parameter vector uses the short form without "lambda".
+    # Also convert vsini + lambda → svsinicoslam + svsinisinlam if needed.
+    _rm_aliases = [('svsinicoslambda', 'svsinicoslam'),
+                   ('svsinisinlambda', 'svsinisinlam')]
+    for long_key, short_key in _rm_aliases:
+        if long_key in priors and short_key not in priors:
+            priors[short_key] = priors[long_key]
+
+    # If only (vsini, lambda) are supplied but no svsinicoslam*, derive them.
+    if ('vsini' in priors and 'lambda' in priors
+            and 'svsinicoslam' not in priors):
+        import math as _math
+        vsini_v = priors['vsini']['value']
+        lam_v   = priors['lambda']['value']
+        sv = _math.sqrt(max(vsini_v, 0.0))
+        priors['svsinicoslam'] = {'value': sv * _math.cos(lam_v),
+                                  'sigma': 0.0, 'lower': np.nan, 'upper': np.nan}
+        priors['svsinisinlam'] = {'value': sv * _math.sin(lam_v),
+                                  'sigma': 0.0, 'lower': np.nan, 'upper': np.nan}
 
     # Map planet-indexed params to unsuffixed aliases (for single-planet compat)
     # e.g. tc_0 → tc, p_0 → p, cosi_0 → cosi (and reverse: tc → tc_0)
@@ -242,6 +303,11 @@ def _make_star(idx, priors, constants):
                         lower=0.0, upper=1e5, scale=1000.0,
                         latex=r'v_{\alpha}', description='Extra broadening',
                         unit='m/s'),
+        vline=_mkpar('vline', priors, initval=_prior_val(priors, 'vline', 5000.0),
+                      lower=0.0, upper=1e6, scale=1000.0,
+                      latex=r'v_{\rm line}',
+                      description='Intrinsic spectral line broadening sigma',
+                      unit='m/s'),
         label=chr(65 + idx),  # 'A', 'B', 'C', ...
     )
 
@@ -395,6 +461,34 @@ def _make_band(name, idx, priors):
     )
 
 
+# ── Build DopplerTomography ──────────────────────────────────────────
+
+def _make_dopptom(filename, priors, idx):
+    """Build a DopplerTomography object from a FITS file.
+
+    Reads the 2-D CCF, BJD, velocity arrays and computes the per-pixel
+    RMS noise.  The ``errscale`` parameter defaults to 1.0 (fixed).
+    """
+    from .exozippy_dopptom import read_dt_fits
+    data = read_dt_fits(filename)
+    errscale_init = _prior_val(priors, f'errscale_{idx}',
+                               _prior_val(priors, 'errscale', 1.0))
+    return DopplerTomography(
+        ccf2d      = data['ccf2d'],
+        bjd        = data['bjd'],
+        vel        = data['vel'],
+        rms        = data['rms'],
+        Rspec      = data['Rspec'],
+        errscale   = _mkpar(f'errscale_{idx}', priors,
+                            initval=errscale_init,
+                            lower=0.0, upper=1e3, scale=0.1,
+                            latex=r'\sigma_{\rm err}',
+                            description='DT error scale factor'),
+        label      = data['label'],
+        filename   = filename,
+    )
+
+
 # ── Detrending helpers ───────────────────────────────────────────────
 
 def _parse_detrend_header(filename):
@@ -494,7 +588,7 @@ def _read_data_with_detrend(filename):
 
 # ── Build Transit ────────────────────────────────────────────────────
 
-def _make_transit(tranfile, idx, priors, tc=None, period=None, fitttv=False):
+def _make_transit(tranfile, idx, priors, tc=None, period=None, fitttv=False, bandndx=0):
     """Build a Transit from a data file."""
     bjd, flux, err, detrendadd, detrendmult = _read_data_with_detrend(tranfile)
 
@@ -546,6 +640,7 @@ def _make_transit(tranfile, idx, priors, tc=None, period=None, fitttv=False):
         detrendaddpars=detrendaddpars,
         detrendmultpars=detrendmultpars,
         epoch=epoch,
+        bandndx=bandndx,
         name=basename,
         label=basename,
     )
@@ -635,6 +730,9 @@ def mkss(
     fitttv=False,
     rossiter=False,
     rmbands=None,
+    dtpath=None,
+    fitdt=False,
+    fiterrscale=False,
 ):
     """
     Construct a Stellar System (SS) structure.
@@ -694,8 +792,13 @@ def mkss(
                              usevcve=usevcve)
                for i in range(nplanets)]
 
-    # Bands (one per unique transit band; for now just one default)
-    bands = [_make_band('default', 0, priors)]
+    # Bands: one per unique filter name (EXOFASTv2 convention)
+    # Band names come from the second dot-separated field of each filename.
+    if tranfiles:
+        unique_bands, tran_bandndx = _get_band_info(tranfiles)
+    else:
+        unique_bands, tran_bandndx = ['default'], []
+    bands = [_make_band(name, i, priors) for i, name in enumerate(unique_bands)]
 
     # Get tc/period for epoch computation
     tc_init = _prior_val(priors, 'tc', 0.0)
@@ -703,7 +806,8 @@ def mkss(
     # Need at least 3 transits for TTV (2-param linear fit needs ≥3 points)
     _fitttv = fitttv and len(tranfiles) >= 3
     transits = [_make_transit(f, i, priors, tc=tc_init, period=period_init,
-                              fitttv=_fitttv)
+                              fitttv=_fitttv,
+                              bandndx=tran_bandndx[i] if tran_bandndx else 0)
                 for i, f in enumerate(tranfiles)]
     telescopes = [_make_telescope(f, i, priors) for i, f in enumerate(rvfiles)]
 
@@ -810,6 +914,27 @@ def mkss(
                         # If not found, use band 0 (default)
                         tel.rmbandndx = 0
 
+    # ── Doppler Tomography ──
+    dtfiles = sorted(glob.glob(dtpath)) if dtpath else []
+    dopptoms = [_make_dopptom(f, priors, j) for j, f in enumerate(dtfiles)]
+
+    if fitdt and dopptoms:
+        # svsinicoslam/svsinisinlam (shared with RM if rossiter=True)
+        if not rossiter:
+            param_names.extend(['svsinicoslam', 'svsinisinlam'])
+            for pl in planets:
+                pl.svsinicoslam.fit = True
+                pl.svsinisinlam.fit = True
+        # vline — intrinsic line broadening
+        param_names.append('vline')
+        for s in stars:
+            s.vline.fit = True
+        # per-DT errscale (optional)
+        if fiterrscale:
+            for j in range(len(dopptoms)):
+                param_names.append(f'errscale_{j}')
+                dopptoms[j].errscale.fit = True
+
     # ── Assemble SS ──
 
     # Compute rvepoch and seed slope/quad from RV data
@@ -840,6 +965,7 @@ def mkss(
         band=bands,
         transit=transits,
         telescope=telescopes,
+        dopptom=dopptoms,
         constants=const,
         nstars=nstars,
         nplanets=nplanets,

@@ -271,9 +271,10 @@ def _compute_sed_model(teff, logg, feh, av, distance, lstar, rstar, sedfile):
 
 def _oc_ylim_sed(residuals):
     """Symmetric O-C y-limits rounded to 0.5 sigma."""
-    ymax = np.max(np.abs(residuals)) * 1.1
-    if ymax == 0:
+    finite = np.abs(residuals[np.isfinite(residuals)])
+    if len(finite) == 0 or finite.max() == 0:
         return 1.0
+    ymax = finite.max() * 1.1
     return np.ceil(ymax / 0.5) * 0.5
 
 
