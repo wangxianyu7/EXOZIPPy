@@ -34,8 +34,8 @@ class TestMistMultiSED(unittest.TestCase):
         errsc  = np.array([1.0])
 
         sedfile = (
-            pathlib.Path(exozippy.MODULE_PATH) /
-            "EXOZIPPy" / "data" / "exofastv2" / "examples" / "hat3" /
+            pathlib.Path(exozippy.DATA_PATH) /
+            "exofastv2" / "examples" / "hat3" /
             "HAT-3.sed"
         )
 

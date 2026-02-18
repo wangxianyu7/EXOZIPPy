@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 import sys, os
 # sys.path.append('../../../sfit_minimizer/source')
-from exozippy.exozippy_tran import exozippy_tran  # Adjust import if needed
+from exozippy.physics.exozippy_tran import exozippy_tran  # Adjust import if needed
 
 class TestExozippyTranFunction(unittest.TestCase):
     def test_transit_model_vs_exofastv2(self):

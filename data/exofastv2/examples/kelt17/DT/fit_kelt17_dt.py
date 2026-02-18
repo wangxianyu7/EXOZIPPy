@@ -54,7 +54,7 @@ for f in dt_files:
 print()
 
 # ── Run fit ────────────────────────────────────────────────────────────
-from exozippy.fit_exoplanet import fit_exoplanet
+from exozippy.jointfit import fit_exoplanet
 
 print('=' * 60)
 print('Starting KELT-17b DT fit (optimizer only, no MCMC)')
@@ -141,15 +141,15 @@ print()
 
 # ── Optional: compute chi2 breakdown ───────────────────────────────────
 try:
-    from exozippy.fit_exoplanet import (
+    from exozippy.jointfit import (
         read_all_transit_data, read_all_rv_data, read_all_dt_data,
         _build_detrend_info,
     )
-    from exozippy.mkss import _parse_priors
-    from exozippy.exozippy_chi2 import joint_chi2
-    from exozippy.exozippy_chi2 import chi2_dt as _chi2_dt
-    from exozippy.exozippy_chi2 import unpack_params as _unpack
-    from exozippy.exozippy_chi2 import compute_derived as _compute_derived
+    from exozippy.jointfit.mkss import _parse_priors
+    from exozippy.jointfit.chi2 import joint_chi2
+    from exozippy.jointfit.chi2 import chi2_dt as _chi2_dt
+    from exozippy.jointfit.chi2 import unpack_params as _unpack
+    from exozippy.jointfit.chi2 import compute_derived as _compute_derived
 
     tran_data_list, _ = read_all_transit_data(TRANPATH)
     rv_data_list,   _ = read_all_rv_data(RVPATH)
@@ -190,7 +190,7 @@ try:
     print(f'  [debug] inc={np.degrees(d["inc"]):.2f} deg, ar={d["ar"]:.3f}, p={d["p"]:.4f}, vsini={d["vsini"]/1000:.2f} km/s, lam={np.degrees(d["lam"]):.2f} deg')
 
     # Effective DT data points
-    from exozippy.exozippy_dopptom import C_LIGHT, FWHM2SIGMA
+    from exozippy.physics.exozippy_dopptom import C_LIGHT, FWHM2SIGMA
     neff_dt = 0.0
     for dtd in dt_data_list:
         vel = dtd['vel']

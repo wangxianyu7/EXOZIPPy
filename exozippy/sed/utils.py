@@ -1,6 +1,6 @@
 import numpy as np
-from ..exozippy_keplereq import *
 from ..utils import *
+from ..utils.kepler import exozippy_keplereq
 import requests
 import re
 import os

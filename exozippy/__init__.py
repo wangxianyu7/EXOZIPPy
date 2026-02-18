@@ -7,11 +7,10 @@ PACKAGE_DIR = path.dirname(path.abspath(__file__))
 # Now it points to the package directory for pip-installed compatibility.
 MODULE_PATH = PACKAGE_DIR
 
-path_1 = path.join(MODULE_PATH, 'data')
-if path.isdir(path_1):
-    DATA_PATH = path_1
-else:
-    DATA_PATH = path.join(path.dirname(__file__), 'data')
+# data/ lives at the repo root (one level above the package directory);
+# fall back to exozippy/data/ for pip-installed environments.
+_repo_data = path.join(path.dirname(PACKAGE_DIR), 'data')
+DATA_PATH = _repo_data if path.isdir(_repo_data) else path.join(PACKAGE_DIR, 'data')
 
 MULENS_DATA_PATH = path.join(DATA_PATH, 'mulens')
 

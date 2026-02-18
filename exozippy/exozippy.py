@@ -15,15 +15,12 @@ import argparse
 import glob as _glob
 import numpy as np
 
-from .fit_exoplanet import fit_exoplanet, run_mcmc, build_initial_guess, parse_priors
-from .massradius_mist import plot_mist_track
-from .plottran import plottran
-from .plotrv import plotrv
-from .plotsed import plotsed
-from .plotmcmc import plot_corner, plot_trace
-from .derivepars import derivepars
-from .exozippy_latextab import summarize_samples, write_csv, exozippy_latextab
-from .mkprior2 import mkprior2
+from .jointfit import fit_exoplanet, run_mcmc, build_initial_guess, parse_priors
+from .physics.massradius_mist import plot_mist_track
+from .plotting import plot_corner, plot_trace, plotrv, plotsed, plottran
+from .export.derivepars import derivepars
+from .export import summarize_samples, write_csv, exozippy_latextab
+from .jointfit.mkprior2 import mkprior2
 
 
 def _log(msg, verbose=True):

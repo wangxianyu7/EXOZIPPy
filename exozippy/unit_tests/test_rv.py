@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from ..exozippy_rv import exozippy_rv
+from ..physics.exozippy_rv import exozippy_rv
 
 class TestExofastRVFunction(unittest.TestCase):
     def test_circular_orbit(self):
